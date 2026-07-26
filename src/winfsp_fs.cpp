@@ -20,6 +20,11 @@
 #include "recordspace.h"
 #include "wsclient.h"
 
+#include <windows.h>
+#include <winternl.h>
+// Some SDK header sets declare NTSTATUS but not PNTSTATUS, which winfsp.h's
+// directory-buffer prototypes use. A duplicate identical typedef is legal.
+typedef NTSTATUS* PNTSTATUS;
 #include <winfsp/winfsp.h>
 
 #include <sddl.h>
@@ -71,8 +76,8 @@ uint64_t now_filetime() {
 // "YYYY-MM-DD HH:MM:SS" (server-local) -> FILETIME as uint64; fallback ft0.
 uint64_t parse_timestamp(const std::string& s, uint64_t fallback) {
   SYSTEMTIME st{};
-  if (6 != std::sscanf(s.c_str(), "%4hu-%2hu-%2hu %2hu:%2hu:%2hu", &st.wYear, &st.wMonth,
-                       &st.wDay, &st.wHour, &st.wMinute, &st.wSecond))
+  if (6 != sscanf_s(s.c_str(), "%4hu-%2hu-%2hu %2hu:%2hu:%2hu", &st.wYear, &st.wMonth,
+                    &st.wDay, &st.wHour, &st.wMinute, &st.wSecond))
     return fallback;
   SYSTEMTIME utc{};
   if (!::TzSpecificLocalTimeToSystemTime(nullptr, &st, &utc)) utc = st;
@@ -355,6 +360,19 @@ NTSTATUS SvcGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR file_name, PUINT32 attribu
   return STATUS_SUCCESS;
 }
 
+// The Create dispatcher requires the Create/Open/Overwrite slots to all be
+// present before it routes ANY open (IoStatus=c0000010 otherwise) — a
+// read-only volume still provides the write pair as rejections. The driver's
+// ReadOnlyVolume gate refuses writes before these are ever reached.
+NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR, UINT32, UINT32, UINT32, PSECURITY_DESCRIPTOR,
+                   UINT64, PVOID*, FSP_FSCTL_FILE_INFO*) {
+  return STATUS_MEDIA_WRITE_PROTECTED;
+}
+
+NTSTATUS SvcOverwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO*) {
+  return STATUS_MEDIA_WRITE_PROTECTED;
+}
+
 NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32, PVOID* file_context,
                  FSP_FSCTL_FILE_INFO* info) {
   auto r = resolve(*g_vol.ns, file_name);
@@ -432,15 +450,13 @@ NTSTATUS SvcGetSecurity(FSP_FILE_SYSTEM*, PVOID, PSECURITY_DESCRIPTOR sd, SIZE_T
 // One FSP_FSCTL_DIR_INFO into the directory buffer.
 bool add_dir_entry(PVOID* dir_buffer, const std::wstring& name, const FSP_FSCTL_FILE_INFO& info,
                    NTSTATUS* result) {
-  union {
-    UINT8 bytes[sizeof(FSP_FSCTL_DIR_INFO) + 260 * sizeof(WCHAR)];
-    FSP_FSCTL_DIR_INFO d;
-  } u{};
+  UINT8 buf[sizeof(FSP_FSCTL_DIR_INFO) + 260 * sizeof(WCHAR)] = {};
+  auto* d = (FSP_FSCTL_DIR_INFO*)buf;  // memfs pattern: header + inline name
   size_t namelen = std::min<size_t>(name.size(), 259);
-  u.d.Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + namelen * sizeof(WCHAR));
-  u.d.FileInfo = info;
-  std::memcpy(u.d.FileNameBuf, name.data(), namelen * sizeof(WCHAR));
-  return FspFileSystemFillDirectoryBuffer(dir_buffer, &u.d, result);
+  d->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + namelen * sizeof(WCHAR));
+  d->FileInfo = info;
+  std::memcpy(d->FileNameBuf, name.data(), namelen * sizeof(WCHAR));
+  return FspFileSystemFillDirectoryBuffer(dir_buffer, d, result);
 }
 
 NTSTATUS SvcReadDirectory(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, PWSTR marker, PVOID buffer,
@@ -529,6 +545,7 @@ int run_mount(const Options& o) {
   }
 
   FSP_FSCTL_VOLUME_PARAMS params{};
+  params.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
   params.SectorSize = 4096;
   params.SectorsPerAllocationUnit = 1;
   params.VolumeCreationTime = ns.mount_time();
@@ -546,6 +563,8 @@ int run_mount(const Options& o) {
   static FSP_FILE_SYSTEM_INTERFACE iface = {};
   iface.GetVolumeInfo = SvcGetVolumeInfo;
   iface.GetSecurityByName = SvcGetSecurityByName;
+  iface.Create = SvcCreate;
+  iface.Overwrite = SvcOverwrite;
   iface.Open = SvcOpen;
   iface.Close = SvcClose;
   iface.Read = SvcRead;
@@ -567,6 +586,13 @@ int run_mount(const Options& o) {
     error("mount point " + o.drive + " unavailable");
     FspFileSystemDelete(fs);
     return 1;
+  }
+  if (o.verbose) {
+    // Per-operation NTSTATUS tracing to stderr — the diagnostic of record
+    // for "the drive mounts but ops fail" (dir syntax/incorrect-function
+    // errors give no clue which callback the driver is unhappy with).
+    FspDebugLogSetHandle(::GetStdHandle(STD_ERROR_HANDLE));
+    FspFileSystemSetDebugLogF(fs, (UINT32)-1);
   }
   st = FspFileSystemStartDispatcher(fs, 0);
   if (!NT_SUCCESS(st)) {
