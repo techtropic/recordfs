@@ -216,4 +216,98 @@ bool WsClient::refresh_client_token(const std::string& token, int ttl_days) {
   return request("refresh_client_token", std::move(d)).value("success", false);
 }
 
+namespace {
+// Standard base64 — the ephemeral plane's inline byte transport.
+std::string b64_encode(const std::string& in) {
+  static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve((in.size() + 2) / 3 * 4);
+  size_t i = 0;
+  for (; i + 2 < in.size(); i += 3) {
+    uint32_t v = (uint8_t)in[i] << 16 | (uint8_t)in[i + 1] << 8 | (uint8_t)in[i + 2];
+    out.push_back(tbl[v >> 18]);
+    out.push_back(tbl[(v >> 12) & 63]);
+    out.push_back(tbl[(v >> 6) & 63]);
+    out.push_back(tbl[v & 63]);
+  }
+  if (i + 1 == in.size()) {
+    uint32_t v = (uint8_t)in[i] << 16;
+    out.push_back(tbl[v >> 18]);
+    out.push_back(tbl[(v >> 12) & 63]);
+    out += "==";
+  } else if (i + 2 == in.size()) {
+    uint32_t v = (uint8_t)in[i] << 16 | (uint8_t)in[i + 1] << 8;
+    out.push_back(tbl[v >> 18]);
+    out.push_back(tbl[(v >> 12) & 63]);
+    out.push_back(tbl[(v >> 6) & 63]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+std::optional<std::string> b64_decode(const std::string& in) {
+  auto val = [](unsigned char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  std::string out;
+  out.reserve(in.size() / 4 * 3);
+  int acc = 0, bits = -8;
+  for (unsigned char c : in) {
+    if (c == '=') break;
+    int v = val(c);
+    if (v < 0) return std::nullopt;
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 0) {
+      out.push_back((char)((acc >> bits) & 0xFF));
+      bits -= 8;
+    }
+  }
+  return out;
+}
+
+nlohmann::json eph_target(const std::string& table, const std::string& key_type,
+                          const nlohmann::json& key, const std::string& path) {
+  nlohmann::json d;
+  d["table"] = table;
+  d["key_type"] = key_type;
+  d["key"] = key;
+  d["path"] = path;
+  return d;
+}
+}  // namespace
+
+bool WsClient::ephemeral_put(const std::string& table, const std::string& key_type,
+                             const nlohmann::json& key, const std::string& path,
+                             const std::string& bytes, std::string* err) {
+  auto d = eph_target(table, key_type, key, path);
+  d["data"] = b64_encode(bytes);
+  auto r = request("ephemeral_put", std::move(d));
+  if (!r.value("success", false)) {
+    if (err) *err = r.value("error", "ephemeral_put failed");
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::string> WsClient::ephemeral_get(const std::string& table,
+                                                   const std::string& key_type,
+                                                   const nlohmann::json& key,
+                                                   const std::string& path) {
+  auto r = request("ephemeral_get", eph_target(table, key_type, key, path));
+  if (!r.value("success", false)) return std::nullopt;
+  return b64_decode(r.value("data", ""));
+}
+
+bool WsClient::ephemeral_delete(const std::string& table, const std::string& key_type,
+                                const nlohmann::json& key, const std::string& path) {
+  return request("ephemeral_delete", eph_target(table, key_type, key, path))
+      .value("success", false);
+}
+
 }  // namespace rfs

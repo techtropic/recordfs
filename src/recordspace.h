@@ -33,6 +33,7 @@ struct FileEntry {
   std::string modified_on; // "YYYY-MM-DD HH:MM:SS" or empty
   bool can_write = false;
   bool is_dir = false;     // explicit inode/directory entry
+  bool ephemeral = false;  // server-memory lock/temp file (protocol §4.3)
 };
 
 // A record's attachment listing as a directory tree. Directories exist both

@@ -175,6 +175,7 @@ public:
         e.size = f.value("size", (uint64_t)0);
         e.modified_on = f.value("modified_on", "");
         e.can_write = f.value("can_write", false);
+        e.ephemeral = f.value("ephemeral", false);
         entries.push_back(std::move(e));
       }
       auto tree = std::make_shared<FileTree>();
@@ -183,6 +184,35 @@ public:
       c.fetched = now;
     }
     return c.tree;
+  }
+
+  // Ephemeral plane pass-throughs, addressed by resolved record. The record's
+  // tree cache is invalidated on every mutation so this client's listings
+  // reflect it immediately; other clients converge within their tree TTL.
+  bool eph_put(const std::string& table, const ObjectEntry& o, const std::string& inner,
+               const std::string& bytes, std::string& err) {
+    bool ok = ws_.ephemeral_put(table, o.numeric ? "id" : "guid",
+                                o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                                "/" + inner, bytes, &err);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+  std::optional<std::string> eph_get(const std::string& table, const ObjectEntry& o,
+                                     const std::string& inner) {
+    return ws_.ephemeral_get(table, o.numeric ? "id" : "guid",
+                             o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                             "/" + inner);
+  }
+  bool eph_del(const std::string& table, const ObjectEntry& o, const std::string& inner) {
+    bool ok = ws_.ephemeral_delete(table, o.numeric ? "id" : "guid",
+                                   o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                                   "/" + inner);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+  void invalidate_tree(const std::string& table, const ObjectEntry& o) {
+    std::lock_guard lock(mutex_);
+    trees_.erase(lower_ascii(table) + "\x1f" + o.key);
   }
 
   // Hydrate-on-open: cache hit or mint + pinned fetch.
@@ -308,9 +338,26 @@ std::optional<Resolved> resolve(NamespaceService& ns, const wchar_t* wpath) {
 
 struct FsContext {  // per-open-handle
   Resolved res;
-  HANDLE local = INVALID_HANDLE_VALUE;  // hydrated cache file (File kind)
+  HANDLE local = INVALID_HANDLE_VALUE;  // hydrated cache file (durable File)
   PVOID dir_buffer = nullptr;
+  // Ephemeral file state: bytes live in this buffer between open and close;
+  // close (or flush) writes them back to the server plane.
+  bool is_eph = false;
+  std::string eph_buf;
+  bool dirty = false;
+  bool deleted = false;
 };
+
+// The D2 pattern gate: which names are ephemeral (server-memory lock/temp
+// files, writable) vs durable attachments (read-only until the P2 write-back
+// engine). Matches Office owner files (~$*) and classic temp/lock suffixes.
+bool is_ephemeral_name(const std::string& leaf) {
+  std::string l = lower_ascii(leaf);
+  if (l.rfind("~$", 0) == 0) return true;
+  for (const char* suf : {".tmp", ".dwl", ".dwl2", ".laccdb", ".ldb"})
+    if (l.size() > strlen(suf) && l.ends_with(suf)) return true;
+  return false;
+}
 
 struct Volume {
   NamespaceService* ns = nullptr;
@@ -325,8 +372,10 @@ void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
   uint64_t t0 = g_vol.ns->mount_time();
   info->CreationTime = info->LastAccessTime = info->LastWriteTime = info->ChangeTime = t0;
   if (r.kind == Resolved::File && r.file) {
-    info->FileAttributes = FILE_ATTRIBUTE_READONLY |
-                           (r.file->can_write ? 0 : 0);  // volume is RO in P1 either way
+    // Durable attachments are read-only until the P2 write-back engine;
+    // ephemeral (lock/temp) files are ordinary writable files.
+    info->FileAttributes =
+        r.file->ephemeral ? FILE_ATTRIBUTE_ARCHIVE : FILE_ATTRIBUTE_READONLY;
     info->FileSize = r.file->size;
     info->AllocationSize = (r.file->size + 4095) / 4096 * 4096;
     uint64_t mt = parse_timestamp(r.file->modified_on, t0);
@@ -367,27 +416,166 @@ NTSTATUS SvcGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR file_name, PUINT32 attribu
   return STATUS_SUCCESS;
 }
 
-// The Create dispatcher requires the Create/Open/Overwrite slots to all be
-// present before it routes ANY open (IoStatus=c0000010 otherwise) — a
-// read-only volume still provides the write pair as rejections. The driver's
-// ReadOnlyVolume gate refuses writes before these are ever reached.
-NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR, UINT32, UINT32, UINT32, PSECURITY_DESCRIPTOR,
-                   UINT64, PVOID*, FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+// Fill info for an open ephemeral handle (its live buffer is the truth).
+void fill_eph_info(const FsContext* ctx, FSP_FSCTL_FILE_INFO* info) {
+  std::memset(info, 0, sizeof(*info));
+  info->FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+  info->FileSize = ctx->eph_buf.size();
+  info->AllocationSize = (info->FileSize + 4095) / 4096 * 4096;
+  uint64_t t = now_filetime();
+  info->CreationTime = info->LastAccessTime = info->LastWriteTime = info->ChangeTime = t;
 }
 
-NTSTATUS SvcOverwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+constexpr size_t kEphMaxBytes = 1 << 20;  // matches the server-side cap
+
+// New files: only ephemeral (lock/temp pattern) names inside a record are
+// creatable — that is the D2 plane. Durable creation is the P2/P3 write-back
+// engine. The Create/Open/Overwrite trio must all exist or the WinFsp Create
+// dispatcher refuses every open with IoStatus=c0000010.
+NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UINT32,
+                   UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* file_context,
+                   FSP_FSCTL_FILE_INFO* info) {
+  if (create_options & FILE_DIRECTORY_FILE) return STATUS_MEDIA_WRITE_PROTECTED;
+
+  // Resolve the parent (everything but the leaf) — it must be inside a record.
+  std::string full = narrow(file_name);
+  auto parts = split_backslash(full);
+  if (parts.size() < 3) return STATUS_MEDIA_WRITE_PROTECTED;
+  std::string leaf = parts.back();
+  if (!is_ephemeral_name(leaf)) return STATUS_MEDIA_WRITE_PROTECTED;
+  std::string parent = full.substr(0, full.find_last_of("\\/"));
+  auto pr = resolve(*g_vol.ns, widen(parent).c_str());
+  if (!pr || (pr->kind != Resolved::ObjectDir && pr->kind != Resolved::InnerDir))
+    return STATUS_OBJECT_PATH_NOT_FOUND;
+
+  auto ctx = std::make_unique<FsContext>();
+  ctx->res = *pr;
+  ctx->res.kind = Resolved::File;
+  ctx->res.inner = pr->inner.empty() ? leaf : pr->inner + "/" + leaf;
+  ctx->is_eph = true;
+  ctx->dirty = true;  // an empty create still registers on close
+  // Register server-side immediately so the file exists for other handles
+  // and other clients from the moment of creation.
+  std::string err;
+  if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, "", err)) {
+    warn("ephemeral create " + ctx->res.inner + ": " + err);
+    return STATUS_IO_DEVICE_ERROR;
+  }
+  fill_eph_info(ctx.get(), info);
+  *file_context = ctx.release();
+  return STATUS_SUCCESS;
 }
 
-NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32, PVOID* file_context,
-                 FSP_FSCTL_FILE_INFO* info) {
+NTSTATUS SvcOverwrite(FSP_FILE_SYSTEM*, PVOID file_context, UINT32, BOOLEAN, UINT64,
+                      FSP_FSCTL_FILE_INFO* info) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
+  ctx->eph_buf.clear();
+  ctx->dirty = true;
+  fill_eph_info(ctx, info);
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS SvcWrite(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offset,
+                  ULONG length, BOOLEAN write_to_eof, BOOLEAN constrained,
+                  PULONG bytes_transferred, FSP_FSCTL_FILE_INFO* info) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
+  size_t off = write_to_eof ? ctx->eph_buf.size() : (size_t)offset;
+  size_t len = length;
+  if (constrained) {
+    if (off >= ctx->eph_buf.size()) {
+      *bytes_transferred = 0;
+      fill_eph_info(ctx, info);
+      return STATUS_SUCCESS;
+    }
+    len = std::min(len, ctx->eph_buf.size() - off);
+  }
+  if (off + len > kEphMaxBytes) return STATUS_DISK_FULL;
+  if (off + len > ctx->eph_buf.size()) ctx->eph_buf.resize(off + len, '\0');
+  std::memcpy(ctx->eph_buf.data() + off, buffer, len);
+  ctx->dirty = true;
+  *bytes_transferred = (ULONG)len;
+  fill_eph_info(ctx, info);
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS SvcSetFileSize(FSP_FILE_SYSTEM*, PVOID file_context, UINT64 new_size,
+                        BOOLEAN allocation_only, FSP_FSCTL_FILE_INFO* info) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (!allocation_only) {
+    if (new_size > kEphMaxBytes) return STATUS_DISK_FULL;
+    ctx->eph_buf.resize((size_t)new_size, '\0');
+    ctx->dirty = true;
+  }
+  fill_eph_info(ctx, info);
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS SvcSetBasicInfo(FSP_FILE_SYSTEM*, PVOID file_context, UINT32, UINT64, UINT64,
+                         UINT64, UINT64, FSP_FSCTL_FILE_INFO* info) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+  // Apps set attributes/times on their lock files; accept and ignore —
+  // ephemeral metadata is not worth a server round-trip.
+  if (ctx->is_eph) {
+    fill_eph_info(ctx, info);
+    return STATUS_SUCCESS;
+  }
+  return STATUS_ACCESS_DENIED;
+}
+
+NTSTATUS SvcCanDelete(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR) {
+  auto* ctx = (FsContext*)file_context;
+  if (ctx && ctx->is_eph) return STATUS_SUCCESS;
+  return STATUS_ACCESS_DENIED;
+}
+
+VOID SvcCleanup(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, ULONG flags) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx || !ctx->is_eph) return;
+  if ((flags & FspCleanupDelete) && !ctx->deleted) {
+    ctx->deleted = true;
+    if (!g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner))
+      warn("ephemeral delete " + ctx->res.inner + " failed");
+    return;
+  }
+  // Cleanup = the app's handle close, and it runs synchronously with it —
+  // flush HERE, not in Close: the kernel defers the final Close IRP, so a
+  // write-back parked there loses the race against the very next open
+  // (write → reopen → read saw the pre-write bytes).
+  if (ctx->dirty && !ctx->deleted) {
+    std::string err;
+    if (g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, ctx->eph_buf, err))
+      ctx->dirty = false;
+    else
+      warn("ephemeral write-back " + ctx->res.inner + ": " + err);
+  }
+}
+
+NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_access,
+                 PVOID* file_context, FSP_FSCTL_FILE_INFO* info) {
   auto r = resolve(*g_vol.ns, file_name);
   if (!r) return STATUS_OBJECT_NAME_NOT_FOUND;
 
   auto ctx = std::make_unique<FsContext>();
   ctx->res = *r;
+  if (r->kind == Resolved::File && r->file->ephemeral) {
+    // Ephemeral: pull the bytes into the handle's buffer; close writes back.
+    ctx->is_eph = true;
+    auto bytes = g_vol.ns->eph_get(r->table, r->object, r->file->path);
+    if (!bytes) return STATUS_OBJECT_NAME_NOT_FOUND;  // vanished (owner died)
+    ctx->eph_buf = std::move(*bytes);
+    ctx->res.inner = r->file->path;
+    fill_eph_info(ctx.get(), info);
+    *file_context = ctx.release();
+    return STATUS_SUCCESS;
+  }
   if (r->kind == Resolved::File) {
+    // Durable attachments are read-only until the P2 write-back engine.
+    if (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE))
+      return STATUS_ACCESS_DENIED;
     std::string err;
     auto local = g_vol.ns->hydrate(*r->file, err);
     if (!local) {
@@ -407,6 +595,12 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32, PVOID* file_
 VOID SvcClose(FSP_FILE_SYSTEM*, PVOID file_context) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return;
+  if (ctx->is_eph && ctx->dirty && !ctx->deleted) {
+    // Close cannot report errors — best-effort write-back with a log trail.
+    std::string err;
+    if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, ctx->eph_buf, err))
+      warn("ephemeral write-back " + ctx->res.inner + ": " + err);
+  }
   if (ctx->local != INVALID_HANDLE_VALUE) ::CloseHandle(ctx->local);
   if (ctx->dir_buffer) FspFileSystemDeleteDirectoryBuffer(&ctx->dir_buffer);
   delete ctx;
@@ -415,6 +609,16 @@ VOID SvcClose(FSP_FILE_SYSTEM*, PVOID file_context) {
 NTSTATUS SvcRead(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offset, ULONG length,
                  PULONG bytes_transferred) {
   auto* ctx = (FsContext*)file_context;
+  if (ctx && ctx->is_eph) {
+    if (offset >= ctx->eph_buf.size()) {
+      *bytes_transferred = 0;
+      return STATUS_END_OF_FILE;
+    }
+    size_t n = std::min<size_t>(length, ctx->eph_buf.size() - (size_t)offset);
+    std::memcpy(buffer, ctx->eph_buf.data() + offset, n);
+    *bytes_transferred = (ULONG)n;
+    return STATUS_SUCCESS;
+  }
   if (!ctx || ctx->local == INVALID_HANDLE_VALUE) return STATUS_INVALID_DEVICE_REQUEST;
   OVERLAPPED ov{};
   ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
@@ -438,7 +642,10 @@ NTSTATUS SvcRead(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offs
 NTSTATUS SvcGetFileInfo(FSP_FILE_SYSTEM*, PVOID file_context, FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
-  fill_file_info(ctx->res, info);
+  if (ctx->is_eph)
+    fill_eph_info(ctx, info);
+  else
+    fill_file_info(ctx->res, info);
   return STATUS_SUCCESS;
 }
 
@@ -563,7 +770,9 @@ int run_mount(const Options& o) {
   params.CasePreservedNames = 1;
   params.UnicodeOnDisk = 1;
   params.PersistentAcls = 0;
-  params.ReadOnlyVolume = 1;  // P1: the driver refuses writes for us
+  // Not ReadOnlyVolume: the ephemeral plane (lock/temp files) is writable.
+  // Durable attachments stay read-only per file (attribute + open denial)
+  // until the P2 write-back engine.
   params.PostCleanupWhenModifiedOnly = 1;
   params.UmFileContextIsUserContext2 = 1;
   wcscpy_s(params.FileSystemName, L"RecordFS");
@@ -576,7 +785,12 @@ int run_mount(const Options& o) {
   iface.Open = SvcOpen;
   iface.Close = SvcClose;
   iface.Read = SvcRead;
+  iface.Write = SvcWrite;
   iface.GetFileInfo = SvcGetFileInfo;
+  iface.SetBasicInfo = SvcSetBasicInfo;
+  iface.SetFileSize = SvcSetFileSize;
+  iface.CanDelete = SvcCanDelete;
+  iface.Cleanup = SvcCleanup;
   iface.GetSecurity = SvcGetSecurity;
   iface.ReadDirectory = SvcReadDirectory;
 

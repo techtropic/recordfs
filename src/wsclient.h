@@ -3,6 +3,7 @@
 #pragma once
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -40,6 +41,15 @@ public:
                             const nlohmann::json& key);
   nlohmann::json get_file_token(const std::string& attachment_guid);
   bool refresh_client_token(const std::string& token, int ttl_days = 30);
+
+  // Ephemeral plane (protocol §4.3/D2): raw bytes in/out, base64 on the wire.
+  bool ephemeral_put(const std::string& table, const std::string& key_type,
+                     const nlohmann::json& key, const std::string& path,
+                     const std::string& bytes, std::string* err = nullptr);
+  std::optional<std::string> ephemeral_get(const std::string& table, const std::string& key_type,
+                                           const nlohmann::json& key, const std::string& path);
+  bool ephemeral_delete(const std::string& table, const std::string& key_type,
+                        const nlohmann::json& key, const std::string& path);
 
   const std::string& url() const { return url_; }
 

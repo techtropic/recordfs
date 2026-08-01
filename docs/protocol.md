@@ -1,6 +1,6 @@
 # The File-Session Protocol
 
-**Version 1 — 2026-07-21.**
+**Version 1.1 — 2026-07-26** (adds the ephemeral plane, §4.4).
 License: **CC-BY-4.0** — copy, implement, and adapt freely with attribution.
 This document specifies everything a file-mounting client (such as RecordFS)
 needs to interoperate with a compliant server. The reference server
@@ -75,6 +75,7 @@ error frame):
 | `get_file_token` | mint a byte-plane grant token | read/write |
 | `refresh_client_token` | slide the mount token's expiry | session |
 | `get_current_stamp` | server change stamp (cheap liveness/staleness probe) | session |
+| `ephemeral_put` / `ephemeral_get` / `ephemeral_delete` | server-memory lock/temp files (§4.4) | read/write |
 | `add_attachment` | create an attachment row | write |
 | `rename_attachment` | rename/move within a record | write |
 | `link_attachment` | link an existing attachment to a record | write |
@@ -156,10 +157,33 @@ Response — one entry per attachment the session user may read:
   mounting client should treat as unavailable-for-bytes.
 - `can_write` reflects the user's write mask on that attachment — surface it
   as the read-only attribute.
-- `ephemeral: true` entries (server-memory lock/temp files, a later protocol
-  phase) exist only while their owning session lives; v1 servers always send
-  `false`.
+- `ephemeral: true` entries are server-memory lock/temp files (§4.4): `guid`
+  and `location` are empty, `can_write` is true, and the bytes travel over
+  the ephemeral requests, not the byte plane.
 - `modified_on` (`YYYY-MM-DD HH:MM:SS`, server-local time) may be absent.
+
+### 4.4 The ephemeral plane — server-memory lock/temp files
+
+Applications sharing files expect the filesystem to carry their lock and
+temp files (`~$Book1.xlsx`, `plot.dwl`, `*.tmp`). These must be visible to
+every client of the same record — that is what makes cross-machine app
+locking work — but they are not documents: servers hold them **in memory**,
+with no durable rows and no blob storage. Properties:
+
+- Addressed like `list_files` plus `path` (leading `/`, `/`-separated; `..`
+  rejected). Bytes travel inline as base64. Per-file cap: 1 MiB (`413`-style
+  `"ephemeral file too large"` error beyond).
+- `ephemeral_put {…target…, path, data}` → `{success}` — create or replace;
+  the entry's owner becomes the writing session.
+- `ephemeral_get {…target…, path}` → `{success, data, size, modified_on}`.
+- `ephemeral_delete {…target…, path}` → `{success}` — **any** session may
+  delete (lock cleanup between applications is cooperative).
+- Lifetime: entries are tied to their owner session; when it disconnects
+  they survive a grace window (~120 s) and then vanish — a crashed client's
+  locks self-clean. Clients MUST treat a missing entry as normal
+  (`success:false`, `"not found"`).
+- Mounting clients gate which names ride this plane by pattern (`~$*`,
+  `*.tmp`, `*.dwl`/`.dwl2`, `*.laccdb`/`.ldb`); everything else is durable.
 
 ## 5. Mount-token management
 
