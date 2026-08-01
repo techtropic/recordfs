@@ -12,8 +12,8 @@ void print_usage() {
     "recordfs — mount business records as a native Windows drive\n"
     "\n"
     "usage:\n"
-    "  recordfs probe       [--server ws://host:port/] [--token T | --profile P]\n"
-    "                       [--table workorders] [--key 50049] [-v]\n"
+    "  recordfs probe       [--server ws[s]://host:port/] [--token T | --profile P]\n"
+    "                       [--table workorders] [--key 50049] [-v] [--insecure]\n"
     "  recordfs store-token  --server ws://host:port/ --token T [--drive S:] [--profile P]\n"
     "  recordfs erase-token [--profile P]\n"
     "  recordfs mount       [--profile P] [--drive S:]\n");
@@ -36,6 +36,7 @@ std::optional<Options> parse_args(int argc, char** argv) {
     else if (a == "--table")  { auto* v = need("--table");   if (!v) return std::nullopt; o.table = v; }
     else if (a == "--key")    { auto* v = need("--key");     if (!v) return std::nullopt; o.key = v; }
     else if (a == "-v" || a == "--verbose") { o.verbose = true; }
+    else if (a == "--insecure") { o.insecure = true; }
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); print_usage(); return std::nullopt; }
   }
   if (o.command != "probe" && o.command != "store-token" && o.command != "erase-token" &&

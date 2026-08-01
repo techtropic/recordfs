@@ -13,12 +13,15 @@ namespace rfs {
 //
 // Synchronous, one connection, thread-safe: concurrent callers are
 // mutex-serialized per request/response round-trip (file sessions receive no
-// unsolicited frames, so strict request→response pairing holds). Transport
-// today is plain ws:// — wss:// support is a planned addition behind this
-// same interface.
+// unsolicited frames, so strict request→response pairing holds).
+//
+// Transports: ws:// (plain) and wss:// (TLS). wss verifies the server
+// certificate against the Windows ROOT store with hostname checking;
+// `insecure` disables verification (dev/self-signed only — never in
+// production; the connection still encrypts but proves nothing).
 class WsClient {
 public:
-  explicit WsClient(std::string url);  // ws://host:port/
+  explicit WsClient(std::string url, bool insecure = false);  // ws[s]://host:port/
   ~WsClient();
   WsClient(const WsClient&) = delete;
   WsClient& operator=(const WsClient&) = delete;

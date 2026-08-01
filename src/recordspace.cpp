@@ -24,15 +24,8 @@ std::string sanitize_component(const std::string& s) {
 
 std::string object_dir_name(const std::string& key, const std::string& display) {
   std::string d = sanitize_component(display);
-  if (d == "_" || d.empty() || d == key) return sanitize_component(key);
-  return sanitize_component(key) + " - " + d;
-}
-
-std::optional<std::string> key_from_dir_name(const std::string& dir) {
-  auto sep = dir.find(" - ");
-  std::string key = (sep == std::string::npos) ? dir : dir.substr(0, sep);
-  if (key.empty()) return std::nullopt;
-  return key;
+  if (d == "_" || d.empty()) return sanitize_component(key);
+  return d;
 }
 
 namespace {

@@ -30,7 +30,8 @@ int run_probe(const Options& o) {
   std::string table = o.table.empty() ? "workorders" : o.table;
   std::printf("recordfs probe — %s\n", o.server.c_str());
 
-  WsClient ws(o.server);
+  WsClient ws(o.server, o.insecure);
+  if (o.insecure) warn("--insecure: server certificate NOT verified");
   if (!ws.login(o.token)) {
     error("login failed: token invalid, expired, or revoked");
     return 1;

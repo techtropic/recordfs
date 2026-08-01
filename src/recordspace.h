@@ -10,21 +10,19 @@ namespace rfs {
 
 // The mapping between protocol namespace and filesystem names.
 //
-//   \<table>\<key> - <sanitized display>\<attachment path...>
+//   \<table>\<sanitized display>\<attachment path...>
 //
-// The record key leads the directory name: it is the identity (unique,
-// parseable back out); the display part is cosmetic and may change without
-// breaking anything that stored a path.
+// The object directory is the record's DISPLAY string (people navigate by
+// what they read in the app). Identity stays the record key: the namespace
+// layer keeps a name→key map, and a rare display collision gets a
+// deterministic " [<key>]" suffix.
 
 // Replace filesystem-hostile characters, trim trailing dots/spaces, cap length.
 std::string sanitize_component(const std::string& s);
 
-// "50049 - 250089 - Chris Wilson - Lot 22"
+// "250089 - Chris Wilson - Lot 22" (falls back to the key when the display
+// is empty/unusable).
 std::string object_dir_name(const std::string& key, const std::string& display);
-
-// Parse the record key back off an object directory name ("<key> - ..." or
-// bare "<key>"). nullopt if the name has no usable key prefix.
-std::optional<std::string> key_from_dir_name(const std::string& dir);
 
 struct FileEntry {
   std::string guid;

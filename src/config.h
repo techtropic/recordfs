@@ -16,6 +16,7 @@ struct Options {
   std::string table;              // probe: focus table (default workorders)
   std::string key;                // probe: focus record key
   bool verbose = false;
+  bool insecure = false;          // wss: skip certificate verification (dev only)
 };
 
 // Parse argv. On error prints usage and returns nullopt.

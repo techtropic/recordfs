@@ -125,7 +125,12 @@ public:
         if (e.key.empty()) continue;
         e.numeric = o.contains("id");
         if (e.numeric) e.id = o["id"].get<long long>();
+        // Dir name = the display string alone (Marc: people navigate by what
+        // the app shows). Identity is still the key: a display collision gets
+        // a deterministic " [<key>]" suffix so both records stay reachable.
         e.dir_name = object_dir_name(e.key, o.value("display", ""));
+        if (c.by_name.count(lower_ascii(e.dir_name)))
+          e.dir_name += " [" + sanitize_component(e.key) + "]";
         c.by_name[lower_ascii(e.dir_name)] = c.entries.size();
         c.entries.push_back(std::move(e));
       }
@@ -140,11 +145,13 @@ public:
     auto& c = objects_[lower_ascii(table)];
     auto it = c.by_name.find(lower_ascii(dir_name));
     if (it != c.by_name.end()) return c.entries[it->second];
-    // Directory names are stable through key-prefixing, but a record's display
-    // can change between listings; fall back to the key prefix.
-    if (auto key = key_from_dir_name(dir_name)) {
+    // A collision-suffixed name ("... [<key>]") stays resolvable by key even
+    // if the display changed between listings.
+    auto lb = dir_name.rfind(" [");
+    if (lb != std::string::npos && dir_name.back() == ']') {
+      std::string key = dir_name.substr(lb + 2, dir_name.size() - lb - 3);
       for (const auto& e : c.entries)
-        if (e.key == *key) return e;
+        if (e.key == key) return e;
     }
     return std::nullopt;
   }
@@ -525,7 +532,8 @@ int run_mount(const Options& o) {
     return 1;
   }
 
-  WsClient ws(o.server);
+  WsClient ws(o.server, o.insecure);
+  if (o.insecure) warn("--insecure: server certificate NOT verified");
   if (!ws.login(o.token)) {
     error("login failed: token invalid, expired, or revoked");
     return 1;
