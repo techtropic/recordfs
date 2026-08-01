@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT
+     The RecordFS Setup bundle (Burn bootstrapper): chains the OFFICIAL,
+     UNMODIFIED, signed WinFsp installer first (we are required to use it —
+     never repackage the driver), then the RecordFS MSI. WinFsp is Permanent:
+     uninstalling RecordFS must not rip the filesystem driver out from under
+     other WinFsp consumers (sshfs-win, rclone, ...).
+
+     Drop the official WinFsp MSI at redist\winfsp.msi before building —
+     see redist\README.md. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension">
+
+  <Bundle Name="RecordFS Setup"
+          Version="$(var.RecordFSVersion)"
+          Manufacturer="Techtropic Inc."
+          AboutUrl="https://github.com/marcmicalizzi/recordfs"
+          UpgradeCode="0A7D21E6-84C3-4E5B-9F1A-6D2B58C7A934">
+
+    <BootstrapperApplicationRef Id="WixStandardBootstrapperApplication.RtfLicense">
+      <bal:WixStandardBootstrapperApplication
+          LicenseFile="..\lic.rtf"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplicationRef>
+
+    <Chain>
+      <!-- The official WinFsp package installs/updates itself as needed; the
+           MSI engine detects an existing equal-or-newer install and skips. -->
+      <MsiPackage Id="WinFsp"
+                  SourceFile="redist\winfsp.msi"
+                  Permanent="yes"
+                  Visible="yes"
+                  DisplayInternalUI="no"
+                  Compressed="yes" />
+      <MsiPackage Id="RecordFSMsi"
+                  SourceFile="$(var.SetupRecordFS.TargetPath)"
+                  Compressed="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

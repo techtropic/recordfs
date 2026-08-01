@@ -1,6 +1,6 @@
 # RecordFS — mount business records as a native Windows drive.
 # Copyright (C) 2026 Marc Micalizzi
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.24)
 project(recordfs VERSION 0.1.0 LANGUAGES CXX)
 

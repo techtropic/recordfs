@@ -2,7 +2,7 @@
   "name": "recordfs",
   "version-string": "0.1.0",
   "description": "Mount your business records as a native Windows drive (WinFsp).",
-  "license": "GPL-3.0-only",
+  "license": "MIT",
   "dependencies": [
     "boost-beast",
     "boost-asio",

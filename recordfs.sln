@@ -1,0 +1,40 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.0.36252.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "recordfs", "recordfs.vcxproj", "{993960F2-5BC2-4043-86E1-A2E151531577}"
+EndProject
+Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "SetupRecordFS", "SetupRecordFS\SetupRecordFS.wixproj", "{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}"
+EndProject
+Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "SetupRecordFSBundle", "SetupRecordFSBundle\SetupRecordFSBundle.wixproj", "{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+		Release Signed|x64 = Release Signed|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Debug|x64.ActiveCfg = Debug|x64
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Debug|x64.Build.0 = Debug|x64
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Release|x64.ActiveCfg = Release|x64
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Release|x64.Build.0 = Release|x64
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Release Signed|x64.ActiveCfg = Release Signed|x64
+		{993960F2-5BC2-4043-86E1-A2E151531577}.Release Signed|x64.Build.0 = Release Signed|x64
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Debug|x64.ActiveCfg = Debug|x86
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Debug|x64.Build.0 = Debug|x86
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Release|x64.ActiveCfg = Release|x86
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Release|x64.Build.0 = Release|x86
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Release Signed|x64.ActiveCfg = Release Signed|x86
+		{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}.Release Signed|x64.Build.0 = Release Signed|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Debug|x64.ActiveCfg = Debug|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Debug|x64.Build.0 = Debug|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Release|x64.ActiveCfg = Release|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Release|x64.Build.0 = Release|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Release Signed|x64.ActiveCfg = Release Signed|x86
+		{13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947}.Release Signed|x64.Build.0 = Release Signed|x86
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

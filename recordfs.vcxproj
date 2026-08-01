@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RecordFS — SPDX-License-Identifier: MIT
+     MSBuild build for Visual Studio + the WiX installer projects. The CMake
+     build (CMakeLists.txt) remains the portable/dev path; keep the source
+     lists in sync. Dependencies come from a vcpkg tree at
+     $(SolutionDir)vcpkg_installed\x64-windows\x64-windows (see README) and
+     the WinFsp SDK (Developer feature of the WinFsp installer). -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release Signed|x64">
+      <Configuration>Release Signed</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{993960F2-5BC2-4043-86E1-A2E151531577}</ProjectGuid>
+    <RootNamespace>recordfs</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'!='Debug'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)'!='Debug'">true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)x64\$(Configuration)\</OutDir>
+    <IntDir>obj\$(Configuration)\</IntDir>
+    <VcpkgRoot>$(SolutionDir)vcpkg_installed\x64-windows\x64-windows</VcpkgRoot>
+    <WinFspRoot>$(MSBuildProgramFiles32)\WinFsp</WinFspRoot>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0A00;RECORDFS_HAVE_WINFSP=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>src;shared;$(VcpkgRoot)\include;$(WinFspRoot)\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- 4324: WinFsp's fsctl.h deliberately pads an aligned struct. -->
+      <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <AdditionalLibraryDirectories>$(VcpkgRoot)\lib;$(WinFspRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libssl.lib;libcrypto.lib;winfsp-x64.lib;delayimp.lib;ws2_32.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- WinFsp guidance: delay-load and resolve via FspLoad() so the exe
+           still starts (mount disabled) where WinFsp is not installed. -->
+      <DelayLoadDLLs>winfsp-x64.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <Optimization>Disabled</Optimization>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'!='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- Co-locate the OpenSSL runtime DLLs (dynamic vcpkg triplet) so the exe
+       runs from the output dir and the MSI can pick them up from one place.
+       Release Signed additionally signs the exe (Azure Trusted Signing;
+       expects tsmetadata.json at the solution root — not committed). -->
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>copy /y "$(VcpkgRoot)\bin\libssl-3-x64.dll" "$(OutDir)" &amp;&amp; copy /y "$(VcpkgRoot)\bin\libcrypto-3-x64.dll" "$(OutDir)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release Signed'">
+    <PostBuildEvent>
+      <Command>copy /y "$(VcpkgRoot)\bin\libssl-3-x64.dll" "$(OutDir)" &amp;&amp; copy /y "$(VcpkgRoot)\bin\libcrypto-3-x64.dll" "$(OutDir)"
+echo Signing with Azure Trusted Signing...
+"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /tr http://timestamp.acs.microsoft.com /td sha256 /fd sha256 /dlib "C:\Program Files\MicrosoftTrustedSigningClientTools\Azure.CodeSigning.Dlib.dll" /dmdf "$(SolutionDir)tsmetadata.json" "$(TargetPath)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\config.cpp" />
+    <ClCompile Include="src\credstore.cpp" />
+    <ClCompile Include="src\filecache.cpp" />
+    <ClCompile Include="src\fsdclient.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\probe.cpp" />
+    <ClCompile Include="src\recordspace.cpp" />
+    <ClCompile Include="src\winfsp_fs.cpp" />
+    <ClCompile Include="src\wsclient.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\config.h" />
+    <ClInclude Include="src\filecache.h" />
+    <ClInclude Include="src\fsdclient.h" />
+    <ClInclude Include="src\log.h" />
+    <ClInclude Include="src\probe.h" />
+    <ClInclude Include="src\recordspace.h" />
+    <ClInclude Include="src\wsclient.h" />
+    <ClInclude Include="shared\record_mount_credentials.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

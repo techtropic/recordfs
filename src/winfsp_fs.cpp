@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Marc Micalizzi
 //
 // The WinFsp adapter: presents the record namespace as a read-only drive.

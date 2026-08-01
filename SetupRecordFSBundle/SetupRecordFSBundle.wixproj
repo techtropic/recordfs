@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" InitialTargets="EnsureWixToolsetInstalled" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
+    <ProductVersion>3.10</ProductVersion>
+    <ProjectGuid>13C9CBE8-A9F9-4801-AEB6-05CF5BCAE947</ProjectGuid>
+    <SchemaVersion>2.0</SchemaVersion>
+    <OutputName>RecordFSSetup</OutputName>
+    <OutputType>Bundle</OutputType>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>obj\$(Configuration)\</IntermediateOutputPath>
+    <DefineConstants>Debug</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>obj\$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release Signed|x86' ">
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>obj\$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+  <PropertyGroup>
+    <RecordFSVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION.txt').Trim())</RecordFSVersion>
+    <DefineConstants>$(DefineConstants);RecordFSVersion=$(RecordFSVersion)</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Bundle.wxs" />
+  </ItemGroup>
+  <ItemGroup>
+    <WixExtension Include="WixBalExtension">
+      <HintPath>$(WixExtDir)\WixBalExtension.dll</HintPath>
+      <Name>WixBalExtension</Name>
+    </WixExtension>
+    <WixExtension Include="WixUtilExtension">
+      <HintPath>$(WixExtDir)\WixUtilExtension.dll</HintPath>
+      <Name>WixUtilExtension</Name>
+    </WixExtension>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Defines $(var.SetupRecordFS.TargetPath) for Bundle.wxs. -->
+    <ProjectReference Include="..\SetupRecordFS\SetupRecordFS.wixproj">
+      <Name>SetupRecordFS</Name>
+      <Project>{DF2406C4-15C9-43A0-A26B-7A6F910DBE0B}</Project>
+      <Private>True</Private>
+      <DoNotHarvest>True</DoNotHarvest>
+      <RefProjectOutputGroups>Binaries;Content;Satellites</RefProjectOutputGroups>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(WixTargetsPath)" Condition=" '$(WixTargetsPath)' != '' " />
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\WiX\v3.x\Wix.targets" Condition=" '$(WixTargetsPath)' == '' AND Exists('$(MSBuildExtensionsPath32)\Microsoft\WiX\v3.x\Wix.targets') " />
+  <Target Name="EnsureWixToolsetInstalled" Condition=" '$(WixTargetsImported)' != 'true' ">
+    <Error Text="The WiX Toolset v3.11 build tools must be installed to build this project. To download the WiX Toolset, see https://wixtoolset.org/releases/v3.11/stable" />
+  </Target>
+  <!-- Signing a Burn bundle needs insignia (detach/reattach the engine). -->
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release Signed' ">
+    <PostBuildEvent>echo Signing bundle (engine + attached container) with Azure Trusted Signing...
+  "$(WixToolPath)\insignia.exe" -ib "$(TargetPath)" -o "$(TargetDir)engine.exe"
+  "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /tr http://timestamp.acs.microsoft.com /td sha256 /fd sha256 /dlib "C:\Program Files\MicrosoftTrustedSigningClientTools\Azure.CodeSigning.Dlib.dll" /dmdf "$(SolutionDir)tsmetadata.json" "$(TargetDir)engine.exe"
+  "$(WixToolPath)\insignia.exe" -ab "$(TargetDir)engine.exe" "$(TargetPath)" -o "$(TargetPath)"
+  "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /tr http://timestamp.acs.microsoft.com /td sha256 /fd sha256 /dlib "C:\Program Files\MicrosoftTrustedSigningClientTools\Azure.CodeSigning.Dlib.dll" /dmdf "$(SolutionDir)tsmetadata.json" "$(TargetPath)"
+  echo Done!</PostBuildEvent>
+  </PropertyGroup>
+</Project>

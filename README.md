@@ -58,6 +58,21 @@ cmake --preset default
 cmake --build build/default
 ```
 
+### Visual Studio / installers
+
+`recordfs.sln` carries the MSBuild path: `recordfs.vcxproj` plus the WiX v3.11
+installer projects — `SetupRecordFS` (the RecordFS MSI) and
+`SetupRecordFSBundle` (the end-user `RecordFSSetup.exe`, which chains the
+official signed WinFsp installer first, then RecordFS). Requirements beyond
+the compiler: the [WiX Toolset v3.11](https://wixtoolset.org/releases/v3.11/stable)
+build tools (+ VS extension for IDE use), a vcpkg dependency tree at
+`vcpkg_installed\x64-windows\x64-windows` next to the solution
+(`vcpkg install --triplet x64-windows --x-install-root=vcpkg_installed\x64-windows`),
+and the official WinFsp MSI dropped at `SetupRecordFSBundle\redist\winfsp.msi`
+(see the README there). The `Release Signed` configuration signs the exe, MSI,
+and bundle engine with Azure Trusted Signing (expects `tsmetadata.json` at the
+solution root; not committed).
+
 ## Usage
 
 ```
@@ -82,14 +97,17 @@ time.
 
 ## License
 
-RecordFS is licensed under the **GNU General Public License v3.0** — see
-[LICENSE](LICENSE). It links against WinFsp under the GPLv3.
+RecordFS is licensed under the **MIT License** — see [LICENSE](LICENSE).
 
-Contributions require a signed [Contributor License Agreement](CLA.md) — see
-[CONTRIBUTING.md](CONTRIBUTING.md). The CLA exists so the project can offer
-future versions under additional license terms (for example, alongside a
-commercial WinFsp license); versions already released under the GPL remain
-GPL forever.
+It links against [WinFsp](https://winfsp.dev), which is GPLv3 with a FLOSS
+exception permitting use by open-source projects under OSI-approved licenses
+(MIT qualifies). The installer chains WinFsp's own unmodified, signed
+installer; RecordFS ships no WinFsp code. If you fork RecordFS into a
+non-FLOSS product, that exception no longer covers you — you would need your
+own WinFsp arrangement.
+
+Contributions are accepted under the same MIT license (inbound = outbound) —
+see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The protocol specification in `docs/` is licensed CC-BY-4.0 so that anyone
 may implement either side of it.
