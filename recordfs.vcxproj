@@ -54,7 +54,10 @@
       <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <!-- WINDOWS subsystem + main() entry: the logon agent must never flash
+           a console; CLI runs re-attach to the caller's console (main.cpp). -->
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <AdditionalLibraryDirectories>$(VcpkgRoot)\lib;$(WinFspRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>libssl.lib;libcrypto.lib;winfsp-x64.lib;delayimp.lib;ws2_32.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- WinFsp guidance: delay-load and resolve via FspLoad() so the exe

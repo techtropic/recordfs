@@ -16,7 +16,8 @@ void print_usage() {
     "                       [--table workorders] [--key 50049] [-v] [--insecure]\n"
     "  recordfs store-token  --server ws://host:port/ --token T [--drive S:] [--profile P]\n"
     "  recordfs erase-token [--profile P]\n"
-    "  recordfs mount       [--profile P] [--drive S:]\n");
+    "  recordfs mount       [--profile P] [--drive S:]\n"
+    "  recordfs agent       [--profile P]   (logon autostart: supervise + mount + retry)\n");
 }
 
 std::optional<Options> parse_args(int argc, char** argv) {
@@ -40,7 +41,8 @@ std::optional<Options> parse_args(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); print_usage(); return std::nullopt; }
   }
   if (o.command != "probe" && o.command != "store-token" && o.command != "erase-token" &&
-      o.command != "mount" && o.command != "help") {
+      o.command != "mount" && o.command != "agent" && o.command != "agent-run" &&
+      o.command != "help") {
     std::fprintf(stderr, "unknown command: %s\n", o.command.c_str());
     print_usage();
     return std::nullopt;

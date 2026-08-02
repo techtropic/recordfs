@@ -4,15 +4,91 @@
 #include "log.h"
 #include "probe.h"
 
+#include <windows.h>
+#include <share.h>
+
 #include <cstdio>
+#include <string>
 
 #ifdef RECORDFS_HAVE_WINFSP
 namespace rfs {
 int run_mount(const Options& o);  // winfsp_fs.cpp
+int run_agent(const Options& o);  // winfsp_fs.cpp (agent worker)
 }
 #endif
 
+namespace {
+
+// The exe is a WINDOWS-subsystem binary so the logon agent never flashes a
+// console; CLI use re-attaches to the invoking terminal's console instead,
+// and the headless agent worker logs to %LOCALAPPDATA%\RecordFS\agent.log.
+void attach_parent_console(bool headless_worker) {
+  if (!headless_worker && ::AttachConsole(ATTACH_PARENT_PROCESS)) {
+    FILE* f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
+    return;
+  }
+  if (headless_worker) {
+    char* base = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&base, &len, "LOCALAPPDATA") == 0 && base) {
+      std::string dir = std::string(base) + "\\RecordFS";
+      free(base);
+      ::CreateDirectoryA(dir.c_str(), nullptr);
+      if (FILE* f = _fsopen((dir + "\\agent.log").c_str(), "a", _SH_DENYNO))
+        rfs::log_target() = f;
+    }
+  }
+}
+
+std::wstring own_path() {
+  wchar_t buf[MAX_PATH];
+  ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  return buf;
+}
+
+// `recordfs agent` — the Run-key entry point. Supervises an `agent-run`
+// child: respawn with a short delay on crash/nonzero exit, stop for good on
+// clean exit (logoff, deliberate stop, WinFsp absent). All child output goes
+// to %LOCALAPPDATA%\RecordFS\agent.log.
+int run_supervisor(const rfs::Options& o) {
+  std::string logdir;
+  {
+    char* base = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&base, &len, "LOCALAPPDATA") == 0 && base) {
+      logdir = std::string(base) + "\\RecordFS";
+      free(base);
+      ::CreateDirectoryA(logdir.c_str(), nullptr);
+    }
+  }
+  for (;;) {
+    // The worker opens its own agent.log (attach_parent_console handles the
+    // redirect) — handle inheritance into a GUI-subsystem CRT is unreliable.
+    std::wstring cmd = L"\"" + own_path() + L"\" agent-run --profile " +
+                       std::wstring(o.profile.begin(), o.profile.end());
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                          nullptr, nullptr, &si, &pi))
+      return 1;
+    ::WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+    if (code == 0) return 0;  // clean stop — do not respawn
+    ::Sleep(5000);
+  }
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
+  attach_parent_console(argc > 1 && std::string(argv[1]) == "agent-run");
   auto opts = rfs::parse_args(argc, argv);
   if (!opts) return 2;
   rfs::Options& o = *opts;
@@ -28,13 +104,15 @@ int main(int argc, char** argv) {
       if (!rfs::resolve_credentials(o)) return 1;
       return rfs::run_probe(o);
     }
-    if (o.command == "mount") {
+    if (o.command == "agent") return run_supervisor(o);
+    if (o.command == "agent-run" || o.command == "mount") {
 #ifdef RECORDFS_HAVE_WINFSP
+      if (o.command == "agent-run") return rfs::run_agent(o);
       if (!rfs::resolve_credentials(o)) return 1;
       return rfs::run_mount(o);
 #else
       rfs::error("this build has no mount support (WinFsp SDK was not present at build time)");
-      return 1;
+      return o.command == "agent-run" ? 0 : 1;  // 0: supervisor must not respawn
 #endif
     }
   } catch (const std::exception& e) {

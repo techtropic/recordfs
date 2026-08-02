@@ -36,6 +36,9 @@ target_compile_definitions(recordfs PRIVATE
   _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
   target_compile_options(recordfs PRIVATE /W4 /EHsc /bigobj /utf-8)
+  # WINDOWS subsystem with a classic main(): the logon agent must never flash
+  # a console; CLI runs re-attach to the caller's console (main.cpp).
+  target_link_options(recordfs PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
 endif()
 
 if(WinFsp_FOUND)

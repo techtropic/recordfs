@@ -46,6 +46,7 @@
     <Feature Id="ProductFeature" Title="RecordFS" Level="1" ConfigurableDirectory="INSTALLFOLDER">
       <ComponentGroupRef Id="ProgramFiles" />
       <ComponentGroupRef Id="PathEntry" />
+      <ComponentGroupRef Id="Autostart" />
     </Feature>
 
     <UIRef Id="WixUI_InstallDir" />
@@ -73,6 +74,21 @@
       </Component>
       <Component Id="license" Guid="*" Win64="yes">
         <File Id="license" Source="..\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Zero-touch autostart: the machine Run key starts `recordfs agent` in
+       EVERY user's session at logon (user context — per-user drive letters
+       and DPAPI credentials fall out of that). The agent waits quietly until
+       that user has logged into the desktop app once (which stores a mount
+       token), supervises the mount, and self-restarts on failures. -->
+  <Fragment>
+    <ComponentGroup Id="Autostart" Directory="INSTALLFOLDER">
+      <Component Id="autostart_run" Guid="7E0C4D5B-3F82-4A19-B6D7-9C1E8A25F460" Win64="yes" KeyPath="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                       Name="RecordFS" Type="string"
+                       Value="&quot;[INSTALLFOLDER]recordfs.exe&quot; agent" />
       </Component>
     </ComponentGroup>
   </Fragment>

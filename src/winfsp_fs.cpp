@@ -732,31 +732,18 @@ BOOL WINAPI ctrl_handler(DWORD) {
 
 }  // namespace
 
-int run_mount(const Options& o) {
-  NTSTATUS st = FspLoad(nullptr);
-  if (!NT_SUCCESS(st)) {
-    error("WinFsp is not installed (FspLoad failed) — install it from https://winfsp.dev/rel/");
-    return 1;
-  }
-
-  WsClient ws(o.server, o.insecure);
-  if (o.insecure) warn("--insecure: server certificate NOT verified");
-  if (!ws.login(o.token)) {
-    error("login failed: token invalid, expired, or revoked");
-    return 1;
-  }
-  ws.refresh_client_token(o.token);  // slide expiry on every mount
-  FileCache cache;
-  std::string table = o.table.empty() ? "workorders" : o.table;
-  NamespaceService ns(ws, cache, {table});
+// Create + mount + start the dispatcher. Returns null with `err` set.
+// NamespaceService must outlive the returned filesystem.
+static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std::string& err) {
   g_vol.ns = &ns;
 
   // Everyone-full-access descriptor; real authorization lives server-side in
-  // the per-user session (and the volume is read-only in P1 regardless).
-  if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+  // the per-user session (durable files stay per-file read-only regardless).
+  if (!g_vol.sd &&
+      !::ConvertStringSecurityDescriptorToSecurityDescriptorW(
           L"O:BAG:BAD:P(A;;FA;;;WD)", SDDL_REVISION_1, &g_vol.sd, &g_vol.sd_size)) {
-    error("failed to build security descriptor");
-    return 1;
+    err = "failed to build security descriptor";
+    return nullptr;
   }
 
   FSP_FSCTL_VOLUME_PARAMS params{};
@@ -795,19 +782,19 @@ int run_mount(const Options& o) {
   iface.ReadDirectory = SvcReadDirectory;
 
   FSP_FILE_SYSTEM* fs = nullptr;
-  st = FspFileSystemCreate((PWSTR)L"" FSP_FSCTL_DISK_DEVICE_NAME, &params, &iface, &fs);
+  NTSTATUS st = FspFileSystemCreate((PWSTR)L"" FSP_FSCTL_DISK_DEVICE_NAME, &params, &iface, &fs);
   if (!NT_SUCCESS(st)) {
-    error("FspFileSystemCreate failed: 0x" + std::to_string((unsigned long)st));
-    return 1;
+    err = "FspFileSystemCreate failed: 0x" + std::to_string((unsigned long)st);
+    return nullptr;
   }
   g_vol.fs = fs;
 
   std::wstring drive = widen(o.drive);
   st = FspFileSystemSetMountPoint(fs, drive.empty() ? nullptr : drive.data());
   if (!NT_SUCCESS(st)) {
-    error("mount point " + o.drive + " unavailable");
+    err = "mount point " + o.drive + " unavailable";
     FspFileSystemDelete(fs);
-    return 1;
+    return nullptr;
   }
   if (o.verbose) {
     // Per-operation NTSTATUS tracing to stderr — the diagnostic of record
@@ -818,21 +805,119 @@ int run_mount(const Options& o) {
   }
   st = FspFileSystemStartDispatcher(fs, 0);
   if (!NT_SUCCESS(st)) {
-    error("failed to start dispatcher");
+    err = "failed to start dispatcher";
     FspFileSystemDelete(fs);
-    return 1;
+    return nullptr;
   }
+  info("mounted " + o.drive + "\\ — server " + o.server);
+  return fs;
+}
 
-  info("mounted " + o.drive + "\\ (read-only) — table " + table + ", server " + o.server);
-  g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
-  ::WaitForSingleObject(g_stop_event, INFINITE);
-
+static void unmount_volume(FSP_FILE_SYSTEM* fs) {
   info("unmounting");
   FspFileSystemStopDispatcher(fs);
   FspFileSystemDelete(fs);
-  ::LocalFree(g_vol.sd);
+}
+
+int run_mount(const Options& o) {
+  NTSTATUS st = FspLoad(nullptr);
+  if (!NT_SUCCESS(st)) {
+    error("WinFsp is not installed (FspLoad failed) — install it from https://winfsp.dev/rel/");
+    return 1;
+  }
+  if (o.insecure) warn("--insecure: server certificate NOT verified");
+  WsClient ws(o.server, o.insecure);
+  if (!ws.login(o.token)) {
+    error("login failed: token invalid, expired, or revoked");
+    return 1;
+  }
+  ws.refresh_client_token(o.token);  // slide expiry on every mount
+  FileCache cache;
+  std::string table = o.table.empty() ? "workorders" : o.table;
+  NamespaceService ns(ws, cache, {table});
+  std::string err;
+  FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
+  if (!fs) {
+    error(err);
+    return 1;
+  }
+  g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
+  ::WaitForSingleObject(g_stop_event, INFINITE);
+  unmount_volume(fs);
   return 0;
+}
+
+// The logon agent (worker half — the supervisor lives in main.cpp): wait for
+// stored credentials, mount, watch the session's liveness, remount with
+// backoff on any failure, and go back to waiting if the token stops
+// authenticating (the fix is "log into Scheduler++ again" — never a prompt).
+// The desktop client signals this event when it stores fresh credentials.
+int run_agent(const Options& base) {
+  NTSTATUS st = FspLoad(nullptr);
+  if (!NT_SUCCESS(st)) {
+    error("agent: WinFsp is not installed — exiting");
+    return 0;  // 0 = do not respawn: retrying won't install a driver
+  }
+  HANDLE cred_event = ::CreateEventW(nullptr, FALSE, FALSE, L"Local\\RecordFS.Credentials");
+  g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
+  HANDLE waits[2] = {g_stop_event, cred_event};
+  auto stopped = [&](DWORD timeout_ms) {
+    return ::WaitForMultipleObjects(2, waits, FALSE, timeout_ms) == WAIT_OBJECT_0;
+  };
+
+  int backoff = 5;
+  for (;;) {
+    Options o = base;
+    o.server.clear();
+    o.token.clear();  // agent trusts the store only — always re-read it
+    if (!resolve_credentials(o)) {
+      info("agent: no stored credentials — waiting (log into Scheduler++ once)");
+      if (stopped(60000)) return 0;
+      continue;
+    }
+    try {
+      WsClient ws(o.server, o.insecure);
+      if (!ws.login(o.token)) {
+        warn("agent: token rejected (revoked/expired) — waiting for fresh credentials");
+        if (stopped(300000)) return 0;
+        continue;
+      }
+      ws.refresh_client_token(o.token);
+      FileCache cache;
+      std::string table = o.table.empty() ? "workorders" : o.table;
+      NamespaceService ns(ws, cache, {table});
+      std::string err;
+      FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
+      if (!fs) throw std::runtime_error(err);
+      backoff = 5;
+
+      // Supervise: liveness probe every 30 s; token refresh daily.
+      int ticks = 0;
+      for (;;) {
+        if (::WaitForSingleObject(g_stop_event, 30000) == WAIT_OBJECT_0) {
+          unmount_volume(fs);
+          return 0;
+        }
+        try {
+          ws.request("get_current_stamp", nlohmann::json::object());
+          if (++ticks >= 2880) {  // ~daily
+            ws.refresh_client_token(o.token);
+            ticks = 0;
+          }
+        } catch (const std::exception& e) {
+          warn(std::string("agent: session lost (") + e.what() + ") — remounting");
+          break;
+        }
+      }
+      unmount_volume(fs);
+    } catch (const std::exception& e) {
+      warn(std::string("agent: ") + e.what());
+    }
+    if (stopped(backoff * 1000)) return 0;
+    backoff = std::min(backoff * 2, 60);
+  }
 }
 
 }  // namespace rfs
