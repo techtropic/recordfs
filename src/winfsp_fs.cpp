@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Marc Micalizzi
 //
-// The WinFsp adapter: presents the record namespace as a read-only drive.
+// The WinFsp adapter: presents the record namespace as a drive.
 //
-//   S:\<table>\<key> - <display>\<attachment path...>
+//   S:\<table>\<record display>\<attachment path...>
 //
-// P1 scope: browse + open (hydrate-on-open, reads served from the local
-// content-addressed cache). The volume is marked read-only at the driver
-// level; the write-back engine arrives in a later phase behind this same
-// namespace service.
+// Browse + open (hydrate-on-open, reads served from the local
+// content-addressed cache), plus the ephemeral plane's writable lock/temp
+// files. Durable attachments are read-only per file until the write-back
+// engine lands behind this same namespace service.
+//
+// Directory names are display strings, but IDENTITY IS ALWAYS THE RECORD KEY:
+// an open handle carries its record by key, and a path whose display has
+// since changed still resolves through the former-names grace map.
 //
 // NOTE: compiled only when the WinFsp SDK is present (RECORDFS_HAVE_WINFSP).
 #ifdef RECORDFS_HAVE_WINFSP
@@ -89,9 +93,15 @@ uint64_t parse_timestamp(const std::string& s, uint64_t fallback) {
 // ---------------------------------------------------------------------------
 // server-backed namespace with TTL caches (dispatcher threads -> mutex)
 
+// How long a renamed record keeps answering to its previous directory name.
+// Long enough to cover an edit-and-save session that straddles a rename;
+// short enough that a name freed by a rename becomes genuinely free soon.
+constexpr auto kFormerNameGrace = std::chrono::minutes(10);
+constexpr size_t kMaxFormerNames = 4096;
+
 struct ObjectEntry {
   std::string key;       // record key (identity)
-  std::string dir_name;  // "<key> - <display>"
+  std::string dir_name;  // the record's display string (see object_dir_name)
   bool numeric = false;
   long long id = 0;
 };
@@ -117,6 +127,9 @@ public:
     auto now = std::chrono::steady_clock::now();
     if (c.fetched + std::chrono::seconds(30) < now || c.entries.empty()) {
       auto r = ws_.list_objects(table);
+      std::vector<std::pair<std::string, std::string>> prev;  // lower(name), key
+      prev.reserve(c.by_name.size());
+      for (const auto& [n, idx] : c.by_name) prev.emplace_back(n, c.entries[idx].key);
       c.entries.clear();
       c.by_name.clear();
       for (const auto& o : r.value("objects", nlohmann::json::array())) {
@@ -134,6 +147,22 @@ public:
         c.by_name[lower_ascii(e.dir_name)] = c.entries.size();
         c.entries.push_back(std::move(e));
       }
+      // Retire names that no longer resolve to the same record. A name now
+      // held by a DIFFERENT record is still retired here, but live names are
+      // matched first in find_object, so the current holder always wins --
+      // a reused display can never be hijacked by this map.
+      for (const auto& [n, key] : prev) {
+        auto it = c.by_name.find(n);
+        if (it != c.by_name.end() && c.entries[it->second].key == key) continue;
+        c.former[n] = FormerName{key, now};
+      }
+      for (auto it = c.former.begin(); it != c.former.end();) {
+        if (now - it->second.retired > kFormerNameGrace) it = c.former.erase(it);
+        else ++it;
+      }
+      // Backstop against pathological rename churn; the age prune is the
+      // real bound.
+      if (c.former.size() > kMaxFormerNames) c.former.clear();
       c.fetched = now;
     }
     return c.entries;
@@ -152,6 +181,12 @@ public:
       std::string key = dir_name.substr(lb + 2, dir_name.size() - lb - 3);
       for (const auto& e : c.entries)
         if (e.key == key) return e;
+    }
+    // Finally: a name this record answered to before a recent rename.
+    auto ft = c.former.find(lower_ascii(dir_name));
+    if (ft != c.former.end()) {
+      for (const auto& e : c.entries)
+        if (e.key == ft->second.key) return e;
     }
     return std::nullopt;
   }
@@ -244,9 +279,20 @@ public:
   }
 
 private:
+  struct FormerName {
+    std::string key;
+    std::chrono::steady_clock::time_point retired;
+  };
   struct ObjectsCache {
     std::vector<ObjectEntry> entries;
     std::map<std::string, size_t> by_name;
+    // Directory names records USED to answer to, kept briefly after a rename.
+    // Applications capture a path at open and re-open by that path later --
+    // the Office/CAD save dance is create-temp / delete-original / rename --
+    // so without this a rename mid-edit turns the next save into
+    // STATUS_OBJECT_NAME_NOT_FOUND. Resolution is by KEY, so the stale path
+    // reaches the record the user meant even though its name moved.
+    std::map<std::string, FormerName> former;
     std::chrono::steady_clock::time_point fetched{};
   };
   struct TreeCache {
