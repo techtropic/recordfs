@@ -73,6 +73,16 @@ and the official WinFsp MSI dropped at `SetupRecordFSBundle\redist\winfsp.msi`
 and bundle engine with Azure Trusted Signing (expects `tsmetadata.json` at the
 solution root; not committed).
 
+### Runtime prerequisites (target machines)
+
+- **WinFsp** — installed by the setup bundle.
+- **Microsoft Visual C++ 2015–2022 x64 Redistributable** — `recordfs.exe` and
+  the bundled OpenSSL DLLs import `MSVCP140`/`VCRUNTIME140`. It is *not*
+  shipped here; deployments that run the record-keeping server's own desktop
+  client already have it. On a machine without it the agent cannot start (a
+  background process that fails to resolve imports does so silently — check
+  `recordfs probe` from a console, which reports the loader error).
+
 ## Usage
 
 ```

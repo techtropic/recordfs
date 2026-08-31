@@ -93,18 +93,23 @@
        runs from the output dir and the MSI can pick them up from one place.
        Release Signed additionally signs the exe (Azure Trusted Signing;
        expects tsmetadata.json at the solution root — not committed). -->
-  <ItemDefinitionGroup>
-    <PostBuildEvent>
-      <Command>copy /y "$(VcpkgRoot)\bin\libssl-3-x64.dll" "$(OutDir)" &amp;&amp; copy /y "$(VcpkgRoot)\bin\libcrypto-3-x64.dll" "$(OutDir)"</Command>
-    </PostBuildEvent>
-  </ItemDefinitionGroup>
+  <!-- Runtime deps: we ship our own OpenSSL DLLs. The VC++ 2015-2022 x64
+       redistributable (MSVCP140/VCRUNTIME140) is a PREREQUISITE, not shipped
+       here — Scheduler++ already requires it on every target machine. -->
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release Signed'">
     <PostBuildEvent>
-      <Command>copy /y "$(VcpkgRoot)\bin\libssl-3-x64.dll" "$(OutDir)" &amp;&amp; copy /y "$(VcpkgRoot)\bin\libcrypto-3-x64.dll" "$(OutDir)"
-echo Signing with Azure Trusted Signing...
+      <Command>echo Signing with Azure Trusted Signing...
 "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /tr http://timestamp.acs.microsoft.com /td sha256 /fd sha256 /dlib "C:\Program Files\MicrosoftTrustedSigningClientTools\Azure.CodeSigning.Dlib.dll" /dmdf "$(SolutionDir)tsmetadata.json" "$(TargetPath)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
+  <Target Name="StageRuntimeDlls" AfterTargets="Build">
+    <ItemGroup>
+      <RuntimeDll Include="$(VcpkgRoot)\bin\libssl-3-x64.dll;$(VcpkgRoot)\bin\libcrypto-3-x64.dll" />
+    </ItemGroup>
+    <Error Condition="'@(RuntimeDll)' == ''"
+           Text="OpenSSL runtime DLLs not found under $(VcpkgRoot)\bin." />
+    <Copy SourceFiles="@(RuntimeDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
   <ItemGroup>
     <ClCompile Include="src\config.cpp" />
     <ClCompile Include="src\credstore.cpp" />

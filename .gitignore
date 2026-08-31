@@ -15,3 +15,4 @@ SetupRecordFSBundle/bin/
 # local-only: signing metadata + redistributed installers
 tsmetadata.json
 SetupRecordFSBundle/redist/*.msi
+SetupRecordFSBundle/redist/*.exe

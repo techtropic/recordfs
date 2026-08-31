@@ -1,15 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-License-Identifier: MIT
-     The RecordFS Setup bundle (Burn bootstrapper): chains the OFFICIAL,
-     UNMODIFIED, signed WinFsp installer first (we are required to use it —
-     never repackage the driver), then the RecordFS MSI. WinFsp is Permanent:
-     uninstalling RecordFS must not rip the filesystem driver out from under
-     other WinFsp consumers (sshfs-win, rclone, ...).
+     The RecordFS Setup bundle (Burn bootstrapper). Chain:
+       1. Microsoft VC++ 2015-2022 x64 redistributable — recordfs.exe and the
+          bundled OpenSSL DLLs import MSVCP140/VCRUNTIME140. We chain the
+          REDIST INSTALLER rather than shipping the DLLs app-local, so the
+          CRT keeps receiving OS-level security servicing.
+       2. The OFFICIAL, UNMODIFIED, signed WinFsp installer (we are required
+          to use it — never repackage the driver).
+       3. The RecordFS MSI.
+     Both third-party packages are Permanent: uninstalling RecordFS must not
+     rip the CRT or the filesystem driver out from under everything else on
+     the machine (sshfs-win, rclone, and every MSVC-built app).
 
-     Drop the official WinFsp MSI at redist\winfsp.msi before building —
+     Drop the two official installers in redist\ before building —
      see redist\README.md. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
-     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension">
+     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 
   <Bundle Name="RecordFS Setup"
           Version="$(var.RecordFSVersion)"
@@ -23,7 +30,31 @@
           SuppressOptionsUI="yes" />
     </BootstrapperApplicationRef>
 
+    <!-- The x64 redist writes its detection key to BOTH registry views, so
+         the 32-bit Burn engine finds it under WOW6432Node (verified). -->
+    <util:RegistrySearch Id="VCRedistInstalledSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                         Value="Installed"
+                         Variable="VCRedistInstalled"
+                         Result="value" />
+
     <Chain>
+      <ExePackage Id="VCRedist"
+                  SourceFile="redist\vc_redist.x64.exe"
+                  DisplayName="Microsoft Visual C++ 2015-2022 Redistributable (x64)"
+                  InstallCommand="/install /quiet /norestart"
+                  RepairCommand="/repair /quiet /norestart"
+                  UninstallCommand="/uninstall /quiet /norestart"
+                  DetectCondition="VCRedistInstalled = 1"
+                  Permanent="yes"
+                  Vital="yes"
+                  Compressed="yes">
+        <!-- 1638: a newer runtime is already present — not a failure.
+             3010: success, reboot pending. -->
+        <ExitCode Value="1638" Behavior="success" />
+        <ExitCode Value="3010" Behavior="scheduleReboot" />
+      </ExePackage>
       <!-- The official WinFsp package installs/updates itself as needed; the
            MSI engine detects an existing equal-or-newer install and skips. -->
       <MsiPackage Id="WinFsp"
