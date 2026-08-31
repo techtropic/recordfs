@@ -216,6 +216,65 @@ bool WsClient::refresh_client_token(const std::string& token, int ttl_days) {
   return request("refresh_client_token", std::move(d)).value("success", false);
 }
 
+nlohmann::json WsClient::get_put_token() {
+  nlohmann::json d;
+  d["op"] = "put";
+  return request("get_file_token", std::move(d));
+}
+
+namespace {
+// Shared shape for the attachment write family: report the server's own
+// reason rather than a generic failure -- the mount surfaces it in the log.
+bool write_result(const nlohmann::json& r, std::string* err) {
+  if (r.value("success", false)) return true;
+  if (err) *err = r.value("error", "refused");
+  return false;
+}
+}  // namespace
+
+bool WsClient::add_attachment(const std::string& table, const std::string& key_type,
+                              const nlohmann::json& key, const std::string& filename,
+                              const std::string& location, const std::string& mimetype,
+                              uint64_t size, std::string* err) {
+  nlohmann::json d;
+  d["table"] = table;
+  d["key_type"] = key_type;
+  d["key"] = key;
+  d["filename"] = filename;
+  d["location"] = location;
+  d["mimetype"] = mimetype;
+  d["size"] = size;
+  return write_result(request("add_attachment", std::move(d)), err);
+}
+
+bool WsClient::update_attachment_location(const std::string& guid, const std::string& location,
+                                          uint64_t size, std::string* err) {
+  nlohmann::json d;
+  d["attachment_guid"] = guid;
+  d["location"] = location;
+  d["size"] = size;
+  return write_result(request("update_attachment_location", std::move(d)), err);
+}
+
+bool WsClient::rename_attachment(const std::string& guid, const std::string& filename,
+                                 std::string* err) {
+  nlohmann::json d;
+  d["attachment_guid"] = guid;
+  d["filename"] = filename;
+  return write_result(request("rename_attachment", std::move(d)), err);
+}
+
+bool WsClient::delete_attachment(const std::string& table, const std::string& key_type,
+                                 const nlohmann::json& key, const std::string& guid,
+                                 std::string* err) {
+  nlohmann::json d;
+  d["table"] = table;
+  d["key_type"] = key_type;
+  d["key"] = key;
+  d["attachment_guid"] = guid;
+  return write_result(request("delete_attachment", std::move(d)), err);
+}
+
 namespace {
 // Standard base64 — the ephemeral plane's inline byte transport.
 std::string b64_encode(const std::string& in) {

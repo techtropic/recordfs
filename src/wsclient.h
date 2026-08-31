@@ -42,6 +42,23 @@ public:
   nlohmann::json get_file_token(const std::string& attachment_guid);
   bool refresh_client_token(const std::string& token, int ttl_days = 30);
 
+  // Byte-plane upload grant (protocol §6.1, op=put).
+  nlohmann::json get_put_token();
+
+  // Attachment metadata writes (protocol §3 write family). Each returns false
+  // and fills `err` on refusal (permission, unknown row, bad location).
+  bool add_attachment(const std::string& table, const std::string& key_type,
+                      const nlohmann::json& key, const std::string& filename,
+                      const std::string& location, const std::string& mimetype,
+                      uint64_t size, std::string* err = nullptr);
+  bool update_attachment_location(const std::string& guid, const std::string& location,
+                                  uint64_t size, std::string* err = nullptr);
+  bool rename_attachment(const std::string& guid, const std::string& filename,
+                         std::string* err = nullptr);
+  bool delete_attachment(const std::string& table, const std::string& key_type,
+                         const nlohmann::json& key, const std::string& guid,
+                         std::string* err = nullptr);
+
   // Ephemeral plane (protocol §4.3/D2): raw bytes in/out, base64 on the wire.
   bool ephemeral_put(const std::string& table, const std::string& key_type,
                      const nlohmann::json& key, const std::string& path,

@@ -32,3 +32,26 @@ false pass when the ephemeral write plane is unavailable.
 
 Verified to have teeth: with the former-names lookup compiled out, the real
 assertion fails (`FileNotFoundError`) while the control still passes.
+
+## write_back_e2e.py
+
+The durable write-back engine: create, modify (verifying the attachment row is
+*re-pointed*, not replaced — the guid must be stable), no-op save detection,
+rename, nested paths, directory create/remove, and delete. Every assertion is
+checked SERVER-SIDE via `list_files`, not just locally, so the Windows
+metadata cache cannot fake a pass.
+
+## app_scenarios_e2e.py
+
+What real applications actually do:
+
+- **the Office/CAD save dance** — a `~$` lock file on the ephemeral plane, new
+  content written to a temp name, then renamed into place. That rename is a
+  *promotion*: ephemeral bytes become a durable attachment.
+- **a multi-MB file**, to exercise the streaming upload path.
+- **a concurrent-edit conflict** — a peer re-points the row while our handle
+  is open. Ours must land beside theirs as a conflict copy, and theirs must
+  survive.
+
+Both need the same setup as `rename_grace_e2e.py` and leave the record exactly
+as they found it.

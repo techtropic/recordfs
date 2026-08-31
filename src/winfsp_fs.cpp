@@ -38,6 +38,8 @@ typedef NTSTATUS* PNTSTATUS;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -250,6 +252,96 @@ public:
     trees_.erase(lower_ascii(table) + "\x1f" + o.key);
   }
 
+  // --- write-back plane -----------------------------------------------------
+
+  // Upload a working copy and return its content id. The grant is minted per
+  // upload (op=put, ~120 s) exactly like the download side.
+  bool upload(const std::filesystem::path& src, std::string& hash_out, uint64_t& size_out,
+              std::string& err) {
+    nlohmann::json grant;
+    try {
+      grant = ws_.get_put_token();
+    } catch (const std::exception& e) {
+      err = e.what();
+      return false;
+    }
+    if (!grant.contains("result")) {
+      err = grant.value("error", "upload grant refused");
+      return false;
+    }
+    auto res = grant["result"];
+    if (res.value("mode", "") != "direct") {
+      err = "direct byte plane unavailable";
+      return false;
+    }
+    auto put = put_blob(res.value("urls", std::vector<std::string>{}),
+                        res.value("fingerprint", ""), res.value("token", ""), src);
+    if (!put.ok) {
+      err = put.error;
+      return false;
+    }
+    hash_out = put.hash;
+    size_out = put.size;
+    return true;
+  }
+
+  // The record's CURRENT server-side entry for a path, bypassing the tree TTL.
+  // Used for last-moment conflict detection before re-pointing a row.
+  std::optional<FileEntry> live_entry(const std::string& table, const ObjectEntry& o,
+                                      const std::string& inner) {
+    try {
+      auto r = ws_.list_files(table, o.numeric ? "id" : "guid",
+                              o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key));
+      for (const auto& f : r.value("files", nlohmann::json::array())) {
+        std::string path = f.value("filename", "");
+        while (!path.empty() && (path.front() == '/' || path.front() == '\\')) path.erase(0, 1);
+        if (lower_ascii(path) != lower_ascii(inner)) continue;
+        FileEntry e;
+        e.guid = f.value("guid", "");
+        e.path = path;
+        e.location = f.value("location", "");
+        e.mimetype = f.value("mimetype", "");
+        e.size = f.value("size", (uint64_t)0);
+        e.can_write = f.value("can_write", false);
+        e.ephemeral = f.value("ephemeral", false);
+        return e;
+      }
+    } catch (const std::exception&) {}
+    return std::nullopt;
+  }
+
+  bool add_file(const std::string& table, const ObjectEntry& o, const std::string& inner,
+                const std::string& location, const std::string& mimetype, uint64_t size,
+                std::string& err) {
+    bool ok = ws_.add_attachment(table, o.numeric ? "id" : "guid",
+                                 o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                                 "/" + inner, location, mimetype, size, &err);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+  bool repoint_file(const std::string& table, const ObjectEntry& o, const std::string& guid,
+                    const std::string& location, uint64_t size, std::string& err) {
+    bool ok = ws_.update_attachment_location(guid, location, size, &err);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+  bool rename_file(const std::string& table, const ObjectEntry& o, const std::string& guid,
+                   const std::string& inner, std::string& err) {
+    bool ok = ws_.rename_attachment(guid, "/" + inner, &err);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+  bool delete_file(const std::string& table, const ObjectEntry& o, const std::string& guid,
+                   std::string& err) {
+    bool ok = ws_.delete_attachment(table, o.numeric ? "id" : "guid",
+                                    o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                                    guid, &err);
+    if (ok) invalidate_tree(table, o);
+    return ok;
+  }
+
+  const FileCache& cache() const { return cache_; }
+
   // Hydrate-on-open: cache hit or mint + pinned fetch.
   std::optional<std::filesystem::path> hydrate(const FileEntry& e, std::string& err) {
     if (!e.location.starts_with("sha256:")) {
@@ -384,15 +476,101 @@ std::optional<Resolved> resolve(NamespaceService& ns, const wchar_t* wpath) {
 
 struct FsContext {  // per-open-handle
   Resolved res;
-  HANDLE local = INVALID_HANDLE_VALUE;  // hydrated cache file (durable File)
+  HANDLE local = INVALID_HANDLE_VALUE;  // hydrated cache file (durable, read)
   PVOID dir_buffer = nullptr;
   // Ephemeral file state: bytes live in this buffer between open and close;
-  // close (or flush) writes them back to the server plane.
+  // cleanup writes them back to the server plane.
   bool is_eph = false;
   std::string eph_buf;
   bool dirty = false;
   bool deleted = false;
+
+  // Durable write-back (P2). Opening a durable file for write copies the
+  // hydrated blob up into a private WORKING COPY; writes land there, and
+  // cleanup uploads it and re-points (or creates) the attachment row. Blobs
+  // are immutable and content-addressed, so the original is never mutated.
+  bool is_write = false;                 // working copy is live
+  bool is_new = false;                   // created here; needs add_attachment
+  HANDLE work = INVALID_HANDLE_VALUE;
+  std::filesystem::path work_path;
+  std::string base_hash;                 // content id this copy started from
+  std::string guid;                      // attachment row (empty when is_new)
+  std::string mimetype;
 };
+
+// Per-open working copy under %LOCALAPPDATA%\RecordFS\work.
+std::filesystem::path new_work_path() {
+  static std::atomic<uint64_t> seq{0};
+  std::filesystem::path dir;
+  char* base = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&base, &len, "LOCALAPPDATA") == 0 && base) {
+    dir = std::filesystem::path(base) / "RecordFS" / "work";
+    free(base);
+  } else {
+    dir = std::filesystem::temp_directory_path() / "RecordFS" / "work";
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return dir / (std::to_string(::GetCurrentProcessId()) + "-" +
+                std::to_string(seq.fetch_add(1)) + ".work");
+}
+
+// The server stores mimetype in a 64-char column, and the official
+// OpenXML types are LONGER than that (xlsx is 65, docx 71) -- emitting one
+// makes the attachment row insert fail and the save vanish with only a log
+// line. Office formats therefore map to the generic type (which is what the
+// desktop client stores anyway), and anything over the limit falls back
+// defensively so a future addition cannot silently break saves.
+constexpr size_t kMaxMimetype = 64;
+
+std::string guess_mimetype(const std::string& leaf) {
+  auto dot = leaf.rfind('.');
+  std::string ext = dot == std::string::npos ? "" : lower_ascii(leaf.substr(dot + 1));
+  static const std::map<std::string, std::string> kTypes = {
+      {"pdf","application/pdf"}, {"jpg","image/jpeg"}, {"jpeg","image/jpeg"},
+      {"png","image/png"}, {"gif","image/gif"}, {"bmp","image/bmp"},
+      {"tif","image/tiff"}, {"tiff","image/tiff"},
+      {"txt","text/plain"}, {"log","text/plain"}, {"csv","text/csv"},
+      {"xml","text/xml"}, {"html","text/html"}, {"json","application/json"},
+      {"dwg","image/vnd.dwg"}, {"dxf","image/vnd.dxf"},
+      {"doc","application/msword"}, {"xls","application/vnd.ms-excel"},
+      {"zip","application/zip"}};
+  auto it = kTypes.find(ext);
+  std::string t = it == kTypes.end() ? "application/octet-stream" : it->second;
+  if (t.size() > kMaxMimetype) t = "application/octet-stream";
+  return t;
+}
+
+// Open (creating if needed) the working copy for a handle.
+bool open_work(FsContext* ctx, const std::filesystem::path& seed, std::string& err) {
+  ctx->work_path = new_work_path();
+  if (!seed.empty()) {
+    std::error_code ec;
+    std::filesystem::copy_file(seed, ctx->work_path,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) { err = "copy-up: " + ec.message(); return false; }
+  }
+  ctx->work = ::CreateFileW(ctx->work_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ, nullptr,
+                            seed.empty() ? CREATE_ALWAYS : OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (ctx->work == INVALID_HANDLE_VALUE) { err = "working copy open failed"; return false; }
+  ctx->is_write = true;
+  return true;
+}
+
+void discard_work(FsContext* ctx) {
+  if (ctx->work != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(ctx->work);
+    ctx->work = INVALID_HANDLE_VALUE;
+  }
+  if (!ctx->work_path.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(ctx->work_path, ec);
+    ctx->work_path.clear();
+  }
+}
 
 // The D2 pattern gate: which names are ephemeral (server-memory lock/temp
 // files, writable) vs durable attachments (read-only until the P2 write-back
@@ -418,10 +596,12 @@ void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
   uint64_t t0 = g_vol.ns->mount_time();
   info->CreationTime = info->LastAccessTime = info->LastWriteTime = info->ChangeTime = t0;
   if (r.kind == Resolved::File && r.file) {
-    // Durable attachments are read-only until the P2 write-back engine;
-    // ephemeral (lock/temp) files are ordinary writable files.
-    info->FileAttributes =
-        r.file->ephemeral ? FILE_ATTRIBUTE_ARCHIVE : FILE_ATTRIBUTE_READONLY;
+    // Writability now follows the server's per-attachment mask: the write-back
+    // engine handles durable saves, so only a mask denial marks a file
+    // read-only. Ephemeral (lock/temp) files are always writable.
+    info->FileAttributes = (r.file->ephemeral || r.file->can_write)
+                               ? FILE_ATTRIBUTE_ARCHIVE
+                               : FILE_ATTRIBUTE_READONLY;
     info->FileSize = r.file->size;
     info->AllocationSize = (r.file->size + 4095) / 4096 * 4096;
     uint64_t mt = parse_timestamp(r.file->modified_on, t0);
@@ -462,6 +642,18 @@ NTSTATUS SvcGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR file_name, PUINT32 attribu
   return STATUS_SUCCESS;
 }
 
+// Fill info for an open durable working copy (the copy is the truth).
+void fill_work_info(const FsContext* ctx, FSP_FSCTL_FILE_INFO* info) {
+  std::memset(info, 0, sizeof(*info));
+  info->FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+  LARGE_INTEGER sz{};
+  if (ctx->work != INVALID_HANDLE_VALUE) ::GetFileSizeEx(ctx->work, &sz);
+  info->FileSize = (UINT64)sz.QuadPart;
+  info->AllocationSize = (info->FileSize + 4095) / 4096 * 4096;
+  uint64_t t = now_filetime();
+  info->CreationTime = info->LastAccessTime = info->LastWriteTime = info->ChangeTime = t;
+}
+
 // Fill info for an open ephemeral handle (its live buffer is the truth).
 void fill_eph_info(const FsContext* ctx, FSP_FSCTL_FILE_INFO* info) {
   std::memset(info, 0, sizeof(*info));
@@ -474,40 +666,87 @@ void fill_eph_info(const FsContext* ctx, FSP_FSCTL_FILE_INFO* info) {
 
 constexpr size_t kEphMaxBytes = 1 << 20;  // matches the server-side cap
 
-// New files: only ephemeral (lock/temp pattern) names inside a record are
-// creatable — that is the D2 plane. Durable creation is the P2/P3 write-back
-// engine. The Create/Open/Overwrite trio must all exist or the WinFsp Create
+// New files inside a record. Lock/temp names (the D2 pattern) go to the
+// server-memory ephemeral plane; everything else becomes a real attachment,
+// written through a working copy and registered at cleanup.
+//
+// The parent is resolved as RECORD + remaining path rather than as an
+// existing directory: directories here are implied by attachment paths, so
+// "<record>/sub/file.txt" must work whether or not "sub" exists yet (apps
+// call CreateDirectory then immediately create inside it).
+// The Create/Open/Overwrite trio must all exist or the WinFsp Create
 // dispatcher refuses every open with IoStatus=c0000010.
 NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UINT32,
                    UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* file_context,
                    FSP_FSCTL_FILE_INFO* info) {
-  if (create_options & FILE_DIRECTORY_FILE) return STATUS_MEDIA_WRITE_PROTECTED;
-
-  // Resolve the parent (everything but the leaf) — it must be inside a record.
   std::string full = narrow(file_name);
   auto parts = split_backslash(full);
-  if (parts.size() < 3) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (parts.size() < 3) return STATUS_MEDIA_WRITE_PROTECTED;  // root / table level
+
+  std::string table;
+  for (const auto& t : g_vol.ns->tables())
+    if (lower_ascii(t) == lower_ascii(parts[0])) table = t;
+  if (table.empty()) return STATUS_OBJECT_PATH_NOT_FOUND;
+  auto obj = g_vol.ns->find_object(table, parts[1]);
+  if (!obj) return STATUS_OBJECT_PATH_NOT_FOUND;
+
+  std::string inner;
+  for (size_t i = 2; i < parts.size(); ++i) {
+    if (i > 2) inner.push_back('/');
+    inner += parts[i];
+  }
   std::string leaf = parts.back();
-  if (!is_ephemeral_name(leaf)) return STATUS_MEDIA_WRITE_PROTECTED;
-  std::string parent = full.substr(0, full.find_last_of("\\/"));
-  auto pr = resolve(*g_vol.ns, widen(parent).c_str());
-  if (!pr || (pr->kind != Resolved::ObjectDir && pr->kind != Resolved::InnerDir))
-    return STATUS_OBJECT_PATH_NOT_FOUND;
 
   auto ctx = std::make_unique<FsContext>();
-  ctx->res = *pr;
   ctx->res.kind = Resolved::File;
-  ctx->res.inner = pr->inner.empty() ? leaf : pr->inner + "/" + leaf;
-  ctx->is_eph = true;
-  ctx->dirty = true;  // an empty create still registers on close
-  // Register server-side immediately so the file exists for other handles
-  // and other clients from the moment of creation.
+  ctx->res.table = table;
+  ctx->res.object = *obj;
+  ctx->res.inner = inner;
+  ctx->res.tree = g_vol.ns->files(table, *obj);
+
+  if (create_options & FILE_DIRECTORY_FILE) {
+    // Persist an explicit directory row (the shape the desktop writes, and
+    // exempt from the byte-plane location check server-side) so an empty
+    // folder survives until something lands in it. Only when it does not
+    // already exist -- either as its own row or implied by some attachment's
+    // path -- otherwise every CreateDirectory on an existing folder would
+    // add ANOTHER row, and one rmdir would leave the duplicates behind.
+    bool implied = ctx->res.tree && ctx->res.tree->find(inner).has_value();
+    if (!implied && !g_vol.ns->live_entry(table, *obj, inner)) {
+      std::string err;
+      if (!g_vol.ns->add_file(table, *obj, inner, "", "inode/directory", 0, err))
+        warn("mkdir " + inner + ": " + err);
+    }
+    ctx->res.kind = Resolved::InnerDir;
+    fill_file_info(ctx->res, info);
+    *file_context = ctx.release();
+    return STATUS_SUCCESS;
+  }
+
+  if (is_ephemeral_name(leaf)) {
+    ctx->is_eph = true;
+    ctx->dirty = true;  // an empty create still registers at cleanup
+    std::string err;
+    if (!g_vol.ns->eph_put(table, *obj, inner, "", err)) {
+      warn("ephemeral create " + inner + ": " + err);
+      return STATUS_IO_DEVICE_ERROR;
+    }
+    fill_eph_info(ctx.get(), info);
+    *file_context = ctx.release();
+    return STATUS_SUCCESS;
+  }
+
+  // Durable create: an empty working copy now, add_attachment at cleanup --
+  // a row cannot exist before its bytes have a content id.
   std::string err;
-  if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, "", err)) {
-    warn("ephemeral create " + ctx->res.inner + ": " + err);
+  if (!open_work(ctx.get(), {}, err)) {
+    warn("create " + inner + ": " + err);
     return STATUS_IO_DEVICE_ERROR;
   }
-  fill_eph_info(ctx.get(), info);
+  ctx->is_new = true;
+  ctx->dirty = true;
+  ctx->mimetype = guess_mimetype(leaf);
+  fill_work_info(ctx.get(), info);
   *file_context = ctx.release();
   return STATUS_SUCCESS;
 }
@@ -515,18 +754,55 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UIN
 NTSTATUS SvcOverwrite(FSP_FILE_SYSTEM*, PVOID file_context, UINT32, BOOLEAN, UINT64,
                       FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
-  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
-  ctx->eph_buf.clear();
-  ctx->dirty = true;
-  fill_eph_info(ctx, info);
-  return STATUS_SUCCESS;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+  if (ctx->is_eph) {
+    ctx->eph_buf.clear();
+    ctx->dirty = true;
+    fill_eph_info(ctx, info);
+    return STATUS_SUCCESS;
+  }
+  if (ctx->is_write) {
+    ::SetFilePointer(ctx->work, 0, nullptr, FILE_BEGIN);
+    ::SetEndOfFile(ctx->work);
+    ctx->dirty = true;
+    fill_work_info(ctx, info);
+    return STATUS_SUCCESS;
+  }
+  return STATUS_ACCESS_DENIED;
 }
 
 NTSTATUS SvcWrite(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offset,
                   ULONG length, BOOLEAN write_to_eof, BOOLEAN constrained,
                   PULONG bytes_transferred, FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
-  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+
+  if (ctx->is_write) {  // durable working copy
+    LARGE_INTEGER cur{};
+    ::GetFileSizeEx(ctx->work, &cur);
+    uint64_t size = (uint64_t)cur.QuadPart;
+    uint64_t off = write_to_eof ? size : offset;
+    ULONG len = length;
+    if (constrained) {
+      if (off >= size) {
+        *bytes_transferred = 0;
+        fill_work_info(ctx, info);
+        return STATUS_SUCCESS;
+      }
+      len = (ULONG)std::min<uint64_t>(len, size - off);
+    }
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD)(off & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD n = 0;
+    if (!::WriteFile(ctx->work, buffer, len, &n, &ov)) return STATUS_IO_DEVICE_ERROR;
+    ctx->dirty = true;
+    *bytes_transferred = n;
+    fill_work_info(ctx, info);
+    return STATUS_SUCCESS;
+  }
+
+  if (!ctx->is_eph) return STATUS_ACCESS_DENIED;
   size_t off = write_to_eof ? ctx->eph_buf.size() : (size_t)offset;
   size_t len = length;
   if (constrained) {
@@ -549,7 +825,19 @@ NTSTATUS SvcWrite(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 off
 NTSTATUS SvcSetFileSize(FSP_FILE_SYSTEM*, PVOID file_context, UINT64 new_size,
                         BOOLEAN allocation_only, FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
-  if (!ctx || !ctx->is_eph) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+  if (ctx->is_write) {
+    if (!allocation_only) {
+      LARGE_INTEGER li;
+      li.QuadPart = (LONGLONG)new_size;
+      ::SetFilePointerEx(ctx->work, li, nullptr, FILE_BEGIN);
+      ::SetEndOfFile(ctx->work);
+      ctx->dirty = true;
+    }
+    fill_work_info(ctx, info);
+    return STATUS_SUCCESS;
+  }
+  if (!ctx->is_eph) return STATUS_ACCESS_DENIED;
   if (!allocation_only) {
     if (new_size > kEphMaxBytes) return STATUS_DISK_FULL;
     ctx->eph_buf.resize((size_t)new_size, '\0');
@@ -563,40 +851,147 @@ NTSTATUS SvcSetBasicInfo(FSP_FILE_SYSTEM*, PVOID file_context, UINT32, UINT64, U
                          UINT64, UINT64, FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
-  // Apps set attributes/times on their lock files; accept and ignore —
-  // ephemeral metadata is not worth a server round-trip.
-  if (ctx->is_eph) {
-    fill_eph_info(ctx, info);
-    return STATUS_SUCCESS;
-  }
-  return STATUS_ACCESS_DENIED;
+  // Apps set attributes/times constantly; accept and ignore. Server-side
+  // timestamps are authoritative and not worth a round-trip per touch.
+  if (ctx->is_eph) fill_eph_info(ctx, info);
+  else if (ctx->is_write) fill_work_info(ctx, info);
+  else fill_file_info(ctx->res, info);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS SvcCanDelete(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR) {
   auto* ctx = (FsContext*)file_context;
-  if (ctx && ctx->is_eph) return STATUS_SUCCESS;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+  if (ctx->is_eph) return STATUS_SUCCESS;
+  if (ctx->is_new) return STATUS_SUCCESS;        // never registered
+  if (ctx->res.kind == Resolved::InnerDir) {
+    // A directory is a real inode/directory row; removable once empty.
+    if (ctx->res.tree && !ctx->res.tree->list(ctx->res.inner).empty())
+      return STATUS_DIRECTORY_NOT_EMPTY;
+    return STATUS_SUCCESS;
+  }
+  if (ctx->res.kind == Resolved::File && ctx->res.file && ctx->res.file->can_write)
+    return STATUS_SUCCESS;                       // soft-deleted at cleanup
   return STATUS_ACCESS_DENIED;
+}
+
+// A conflict-copy name: "plan (conflict 2026-08-31 141233).dwg".
+std::string conflict_name(const std::string& inner) {
+  auto slash = inner.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "" : inner.substr(0, slash + 1);
+  std::string leaf = slash == std::string::npos ? inner : inner.substr(slash + 1);
+  auto dot = leaf.rfind('.');
+  std::string stem = dot == std::string::npos ? leaf : leaf.substr(0, dot);
+  std::string ext = dot == std::string::npos ? "" : leaf.substr(dot);
+  SYSTEMTIME st;
+  ::GetLocalTime(&st);
+  char stamp[32];
+  sprintf_s(stamp, "%04u-%02u-%02u %02u%02u%02u", st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond);
+  return dir + stem + " (conflict " + stamp + ")" + ext;
+}
+
+// Upload the working copy and land it as metadata. Runs at CLEANUP (the
+// app's close), never at Close: the kernel defers the final Close IRP, so a
+// flush parked there loses the race against an immediate reopen.
+void write_back(FsContext* ctx) {
+  ::FlushFileBuffers(ctx->work);
+  ::CloseHandle(ctx->work);
+  ctx->work = INVALID_HANDLE_VALUE;
+
+  // Unchanged bytes are a no-op save: content addressing makes that free to
+  // detect, and it keeps app "save" clicks that changed nothing off the wire.
+  std::string local_hash = "sha256:" + sha256_hex_of_file(ctx->work_path);
+  if (!ctx->is_new && local_hash == ctx->base_hash) {
+    info("no-op save (unchanged): " + ctx->res.inner);
+    return;
+  }
+
+  std::string err, hash;
+  uint64_t size = 0;
+  if (!g_vol.ns->upload(ctx->work_path, hash, size, err)) {
+    error("upload " + ctx->res.inner + ": " + err + " -- working copy kept at " +
+          ctx->work_path.string());
+    ctx->work_path.clear();  // keep it: the user's bytes are in there
+    return;
+  }
+
+  if (ctx->is_new) {
+    if (!g_vol.ns->add_file(ctx->res.table, ctx->res.object, ctx->res.inner, hash,
+                            ctx->mimetype, size, err))
+      error("add " + ctx->res.inner + ": " + err);
+    return;
+  }
+
+  // Conflict check against the CURRENT row, not the cached tree: if someone
+  // else re-pointed it since we copied up, land ours beside theirs instead of
+  // silently overwriting (D3 conflict copies).
+  auto live = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, ctx->res.inner);
+  if (live && !live->location.empty() && live->location != ctx->base_hash) {
+    std::string cname = conflict_name(ctx->res.inner);
+    warn("conflict on " + ctx->res.inner + " (changed since open) -- saving as " + cname);
+    if (!g_vol.ns->add_file(ctx->res.table, ctx->res.object, cname, hash,
+                            ctx->mimetype.empty() ? live->mimetype : ctx->mimetype, size, err))
+      error("conflict copy " + cname + ": " + err);
+    return;
+  }
+
+  std::string guid = !ctx->guid.empty() ? ctx->guid : (live ? live->guid : std::string());
+  if (guid.empty()) {
+    error("save " + ctx->res.inner + ": attachment vanished");
+    return;
+  }
+  if (!g_vol.ns->repoint_file(ctx->res.table, ctx->res.object, guid, hash, size, err))
+    error("save " + ctx->res.inner + ": " + err);
+  else
+    info("saved " + ctx->res.inner + " (" + std::to_string(size) + " bytes)");
 }
 
 VOID SvcCleanup(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, ULONG flags) {
   auto* ctx = (FsContext*)file_context;
-  if (!ctx || !ctx->is_eph) return;
-  if ((flags & FspCleanupDelete) && !ctx->deleted) {
+  if (!ctx) return;
+
+  if (flags & FspCleanupDelete) {
+    if (ctx->deleted) return;
     ctx->deleted = true;
-    if (!g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner))
-      warn("ephemeral delete " + ctx->res.inner + " failed");
+    std::string err;
+    if (ctx->is_eph) {
+      if (!g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner))
+        warn("ephemeral delete " + ctx->res.inner + " failed");
+    } else if (ctx->is_write && ctx->is_new) {
+      discard_work(ctx);                      // never registered; nothing to delete
+    } else {
+      std::string guid = ctx->guid;
+      if (guid.empty() && ctx->res.file) guid = ctx->res.file->guid;
+      if (guid.empty()) {   // directories, and anything the cached tree missed
+        auto live = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, ctx->res.inner);
+        if (live) guid = live->guid;
+      }
+      if (guid.empty() ||
+          !g_vol.ns->delete_file(ctx->res.table, ctx->res.object, guid, err))
+        warn("delete " + ctx->res.inner + ": " + (err.empty() ? "no attachment" : err));
+      else
+        info("deleted " + ctx->res.inner + " (recoverable within retention)");
+      discard_work(ctx);
+    }
     return;
   }
-  // Cleanup = the app's handle close, and it runs synchronously with it —
-  // flush HERE, not in Close: the kernel defers the final Close IRP, so a
-  // write-back parked there loses the race against the very next open
-  // (write → reopen → read saw the pre-write bytes).
-  if (ctx->dirty && !ctx->deleted) {
+
+  // Cleanup is the app's close and runs synchronously with it -- flush HERE.
+  if (!ctx->dirty) return;
+  if (ctx->is_eph) {
     std::string err;
     if (g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, ctx->eph_buf, err))
       ctx->dirty = false;
     else
       warn("ephemeral write-back " + ctx->res.inner + ": " + err);
+    return;
+  }
+  if (ctx->is_write) {
+    write_back(ctx);
+    ctx->dirty = false;
+    ctx->is_write = false;   // the working copy is consumed
+    discard_work(ctx);
   }
 }
 
@@ -607,8 +1002,8 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
 
   auto ctx = std::make_unique<FsContext>();
   ctx->res = *r;
+
   if (r->kind == Resolved::File && r->file->ephemeral) {
-    // Ephemeral: pull the bytes into the handle's buffer; close writes back.
     ctx->is_eph = true;
     auto bytes = g_vol.ns->eph_get(r->table, r->object, r->file->path);
     if (!bytes) return STATUS_OBJECT_NAME_NOT_FOUND;  // vanished (owner died)
@@ -618,15 +1013,32 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
     *file_context = ctx.release();
     return STATUS_SUCCESS;
   }
+
   if (r->kind == Resolved::File) {
-    // Durable attachments are read-only until the P2 write-back engine.
-    if (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE))
-      return STATUS_ACCESS_DENIED;
+    const bool wants_write =
+        (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0;
+    if (wants_write && !r->file->can_write) return STATUS_ACCESS_DENIED;
+
     std::string err;
     auto local = g_vol.ns->hydrate(*r->file, err);
     if (!local) {
       warn("hydrate " + r->file->path + ": " + err);
       return STATUS_IO_DEVICE_ERROR;
+    }
+    ctx->res.inner = r->file->path;
+    ctx->guid = r->file->guid;
+    ctx->base_hash = r->file->location;
+    ctx->mimetype = r->file->mimetype;
+
+    if (wants_write) {
+      // Copy up: writes never touch the shared, immutable cache blob.
+      if (!open_work(ctx.get(), *local, err)) {
+        warn("copy-up " + r->file->path + ": " + err);
+        return STATUS_IO_DEVICE_ERROR;
+      }
+      fill_work_info(ctx.get(), info);
+      *file_context = ctx.release();
+      return STATUS_SUCCESS;
     }
     ctx->local = ::CreateFileW(local->c_str(), GENERIC_READ,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -641,13 +1053,8 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
 VOID SvcClose(FSP_FILE_SYSTEM*, PVOID file_context) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return;
-  if (ctx->is_eph && ctx->dirty && !ctx->deleted) {
-    // Close cannot report errors — best-effort write-back with a log trail.
-    std::string err;
-    if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, ctx->eph_buf, err))
-      warn("ephemeral write-back " + ctx->res.inner + ": " + err);
-  }
   if (ctx->local != INVALID_HANDLE_VALUE) ::CloseHandle(ctx->local);
+  discard_work(ctx);
   if (ctx->dir_buffer) FspFileSystemDeleteDirectoryBuffer(&ctx->dir_buffer);
   delete ctx;
 }
@@ -655,32 +1062,28 @@ VOID SvcClose(FSP_FILE_SYSTEM*, PVOID file_context) {
 NTSTATUS SvcRead(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offset, ULONG length,
                  PULONG bytes_transferred) {
   auto* ctx = (FsContext*)file_context;
-  if (ctx && ctx->is_eph) {
-    if (offset >= ctx->eph_buf.size()) {
-      *bytes_transferred = 0;
-      return STATUS_END_OF_FILE;
-    }
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+
+  if (ctx->is_eph) {
+    if (offset >= ctx->eph_buf.size()) { *bytes_transferred = 0; return STATUS_END_OF_FILE; }
     size_t n = std::min<size_t>(length, ctx->eph_buf.size() - (size_t)offset);
     std::memcpy(buffer, ctx->eph_buf.data() + offset, n);
     *bytes_transferred = (ULONG)n;
     return STATUS_SUCCESS;
   }
-  if (!ctx || ctx->local == INVALID_HANDLE_VALUE) return STATUS_INVALID_DEVICE_REQUEST;
+
+  // A writer must read back its own unflushed writes.
+  HANDLE h = ctx->is_write ? ctx->work : ctx->local;
+  if (h == INVALID_HANDLE_VALUE) return STATUS_INVALID_DEVICE_REQUEST;
   OVERLAPPED ov{};
   ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
   ov.OffsetHigh = (DWORD)(offset >> 32);
   DWORD n = 0;
-  if (!::ReadFile(ctx->local, buffer, length, &n, &ov)) {
-    if (::GetLastError() == ERROR_HANDLE_EOF) {
-      *bytes_transferred = 0;
-      return STATUS_END_OF_FILE;
-    }
+  if (!::ReadFile(h, buffer, length, &n, &ov)) {
+    if (::GetLastError() == ERROR_HANDLE_EOF) { *bytes_transferred = 0; return STATUS_END_OF_FILE; }
     return STATUS_IO_DEVICE_ERROR;
   }
-  if (n == 0) {
-    *bytes_transferred = 0;
-    return STATUS_END_OF_FILE;
-  }
+  if (n == 0) { *bytes_transferred = 0; return STATUS_END_OF_FILE; }
   *bytes_transferred = n;
   return STATUS_SUCCESS;
 }
@@ -688,10 +1091,9 @@ NTSTATUS SvcRead(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 offs
 NTSTATUS SvcGetFileInfo(FSP_FILE_SYSTEM*, PVOID file_context, FSP_FSCTL_FILE_INFO* info) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
-  if (ctx->is_eph)
-    fill_eph_info(ctx, info);
-  else
-    fill_file_info(ctx->res, info);
+  if (ctx->is_eph) fill_eph_info(ctx, info);
+  else if (ctx->is_write) fill_work_info(ctx, info);
+  else fill_file_info(ctx->res, info);
   return STATUS_SUCCESS;
 }
 
@@ -770,6 +1172,89 @@ NTSTATUS SvcReadDirectory(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, PWSTR mar
   return STATUS_SUCCESS;
 }
 
+// Rename within a record. This is the back half of the Office/CAD save dance
+// (write temp, delete original, rename temp into place), so it has to work or
+// saves fail at the last step. A temp file that lived on the ephemeral plane
+// is PROMOTED to a durable attachment here; cross-record moves are refused.
+NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PWSTR new_file_name,
+                   BOOLEAN replace_if_exists) {
+  auto* ctx = (FsContext*)file_context;
+  if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
+
+  std::string dst = narrow(new_file_name);
+  auto parts = split_backslash(dst);
+  if (parts.size() < 3) return STATUS_ACCESS_DENIED;
+  std::string leaf = parts.back();
+  std::string parent = dst.substr(0, dst.find_last_of("\\/"));
+  auto pr = resolve(*g_vol.ns, widen(parent).c_str());
+  if (!pr || (pr->kind != Resolved::ObjectDir && pr->kind != Resolved::InnerDir))
+    return STATUS_OBJECT_PATH_NOT_FOUND;
+  if (pr->object.key != ctx->res.object.key || pr->table != ctx->res.table)
+    return STATUS_NOT_SAME_DEVICE;   // cross-record move: not in this version
+  std::string new_inner = pr->inner.empty() ? leaf : pr->inner + "/" + leaf;
+
+  // Replacing an existing durable target: soft-delete it first so the name is
+  // free (the server keeps it recoverable within retention).
+  auto existing = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, new_inner);
+  if (existing && !existing->guid.empty()) {
+    if (!replace_if_exists) return STATUS_OBJECT_NAME_COLLISION;
+    std::string derr;
+    g_vol.ns->delete_file(ctx->res.table, ctx->res.object, existing->guid, derr);
+  }
+
+  std::string err;
+  if (ctx->is_eph) {
+    if (is_ephemeral_name(leaf)) {   // temp -> temp: stays on the ephemeral plane
+      if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, new_inner, ctx->eph_buf, err))
+        return STATUS_IO_DEVICE_ERROR;
+      g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner);
+      ctx->res.inner = new_inner;
+      ctx->dirty = false;
+      return STATUS_SUCCESS;
+    }
+    // Promotion: the app wrote its new content to a temp name and is now
+    // moving it into place. Upload the buffer and register a real attachment.
+    auto tmp = new_work_path();
+    { std::ofstream out(tmp, std::ios::binary); out.write(ctx->eph_buf.data(), (std::streamsize)ctx->eph_buf.size()); }
+    std::string hash; uint64_t size = 0;
+    bool ok = g_vol.ns->upload(tmp, hash, size, err) &&
+              g_vol.ns->add_file(ctx->res.table, ctx->res.object, new_inner, hash,
+                                 guess_mimetype(leaf), size, err);
+    std::error_code ec; std::filesystem::remove(tmp, ec);
+    if (!ok) { error("promote " + new_inner + ": " + err); return STATUS_IO_DEVICE_ERROR; }
+    g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner);
+    ctx->is_eph = false;
+    ctx->dirty = false;
+    ctx->deleted = true;             // the ephemeral original is gone
+    ctx->res.inner = new_inner;
+    info("promoted " + new_inner + " (" + std::to_string(size) + " bytes)");
+    return STATUS_SUCCESS;
+  }
+
+  // Durable rename. Flush a live working copy first so the bytes follow the
+  // name rather than landing back on the old one at cleanup.
+  if (ctx->is_write && ctx->dirty) {
+    write_back(ctx);
+    ctx->dirty = false;
+    ctx->is_write = false;
+    discard_work(ctx);
+  }
+  std::string guid = !ctx->guid.empty() ? ctx->guid
+                   : (ctx->res.file ? ctx->res.file->guid : std::string());
+  if (guid.empty()) {
+    auto live = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, ctx->res.inner);
+    if (live) guid = live->guid;
+  }
+  if (guid.empty()) return STATUS_OBJECT_NAME_NOT_FOUND;
+  if (!g_vol.ns->rename_file(ctx->res.table, ctx->res.object, guid, new_inner, err)) {
+    error("rename " + ctx->res.inner + " -> " + new_inner + ": " + err);
+    return STATUS_ACCESS_DENIED;
+  }
+  ctx->res.inner = new_inner;
+  ctx->guid = guid;
+  return STATUS_SUCCESS;
+}
+
 HANDLE g_stop_event = nullptr;
 BOOL WINAPI ctrl_handler(DWORD) {
   ::SetEvent(g_stop_event);
@@ -823,6 +1308,7 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
   iface.SetBasicInfo = SvcSetBasicInfo;
   iface.SetFileSize = SvcSetFileSize;
   iface.CanDelete = SvcCanDelete;
+  iface.Rename = SvcRename;
   iface.Cleanup = SvcCleanup;
   iface.GetSecurity = SvcGetSecurity;
   iface.ReadDirectory = SvcReadDirectory;

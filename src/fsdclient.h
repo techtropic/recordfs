@@ -21,6 +21,23 @@ struct FetchResult {
   double ms = 0;          // transfer time
 };
 
+// Upload result for the write-back engine. `hash` is the content id the
+// daemon stored the bytes under -- the value an attachment row is re-pointed
+// at (docs/protocol.md 6.1 op=put).
+struct PutResult {
+  bool ok = false;
+  std::string error;
+  std::string hash;      // "sha256:<hex>"
+  uint64_t size = 0;
+  std::string url_used;
+  double ms = 0;
+};
+
+PutResult put_blob(const std::vector<std::string>& urls,
+                   const std::string& fingerprint,
+                   const std::string& bearer,
+                   const std::filesystem::path& src);
+
 FetchResult fetch_blob(const std::vector<std::string>& urls,
                        const std::string& fingerprint,   // 64 lowercase hex
                        const std::string& hash,          // "sha256:<hex>"

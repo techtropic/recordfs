@@ -10,6 +10,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
 
@@ -156,6 +157,93 @@ std::string sha256_hex_of_file(const std::filesystem::path& p) {
   EVP_DigestFinal_ex(ctx, md, &mdlen);
   EVP_MD_CTX_free(ctx);
   return to_hex(md, mdlen);
+}
+
+namespace {
+// PUT the file to /files under an op=put grant. The daemon hashes the bytes
+// and answers { hash, size }; that hash becomes the attachment's location.
+bool put_one(const UrlParts& u, const std::string& fingerprint, const std::string& bearer,
+             const std::filesystem::path& src, std::string& hash_out, uint64_t& size_out,
+             std::string& err) {
+  try {
+    asio::io_context ioc;
+    ssl::context ctx(ssl::context::tls_client);
+    ctx.set_verify_mode(ssl::verify_none);  // identity = the fingerprint pin
+
+    beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
+    tcp::resolver resolver(ioc);
+    auto results = resolver.resolve(u.host, u.port);
+    beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+    beast::get_lowest_layer(stream).connect(results);
+    stream.handshake(ssl::stream_base::client);
+
+    std::string fp = peer_cert_fingerprint(stream.native_handle());
+    if (fp != fingerprint) {
+      err = "fingerprint mismatch";
+      return false;
+    }
+
+    http::request<http::file_body> req(http::verb::put, "/files", 11);
+    req.set(http::field::host, u.host);
+    req.set(http::field::authorization, "Bearer " + bearer);
+    req.set(http::field::content_type, "application/octet-stream");
+    req.set(http::field::user_agent, "recordfs/0.1");
+    beast::error_code ec;
+    req.body().open(src.string().c_str(), beast::file_mode::read, ec);
+    if (ec) { err = "open " + src.string() + ": " + ec.message(); return false; }
+    req.prepare_payload();
+
+    // Uploads get the same 120 s deadline the daemon allows for a PUT body.
+    beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(120));
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    if (res.result_int() != 200) {
+      err = "HTTP " + std::to_string(res.result_int());
+      return false;
+    }
+    auto j = nlohmann::json::parse(res.body(), nullptr, false);
+    if (j.is_discarded() || !j.contains("hash") || !j["hash"].is_string()) {
+      err = "malformed upload response";
+      return false;
+    }
+    hash_out = j["hash"].get<std::string>();
+    size_out = j.value("size", (uint64_t)0);
+
+    beast::error_code sec;
+    stream.shutdown(sec);
+    return true;
+  } catch (const std::exception& e) {
+    err = e.what();
+    return false;
+  }
+}
+}  // namespace
+
+PutResult put_blob(const std::vector<std::string>& urls, const std::string& fingerprint,
+                   const std::string& bearer, const std::filesystem::path& src) {
+  PutResult r;
+  if (urls.empty()) { r.error = "no advertised urls"; return r; }
+  if (fingerprint.size() != 64) { r.error = "no pinned fingerprint"; return r; }
+  auto t0 = std::chrono::steady_clock::now();
+  for (const auto& url : urls) {
+    UrlParts u;
+    if (!parse_https_url(url, u)) {
+      r.error += (r.error.empty() ? "" : "; ") + url + ": unsupported url";
+      continue;
+    }
+    std::string err;
+    if (put_one(u, fingerprint, bearer, src, r.hash, r.size, err)) {
+      r.ok = true;
+      r.url_used = url;
+      r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      return r;
+    }
+    r.error += (r.error.empty() ? "" : "; ") + url + ": " + err;
+  }
+  return r;
 }
 
 FetchResult fetch_blob(const std::vector<std::string>& urls, const std::string& fingerprint,
