@@ -35,6 +35,8 @@ typedef NTSTATUS* PNTSTATUS;
 
 #include <algorithm>
 #include <chrono>
+#include <set>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -99,6 +101,10 @@ uint64_t parse_timestamp(const std::string& s, uint64_t fallback) {
 // Long enough to cover an edit-and-save session that straddles a rename;
 // short enough that a name freed by a rename becomes genuinely free soon.
 constexpr auto kFormerNameGrace = std::chrono::minutes(10);
+// A blob the daemon does not have will not appear on its own; a daemon that
+// was briefly unreachable will. Remember the former far longer.
+constexpr auto kMissingBlobTtl = std::chrono::minutes(10);
+constexpr auto kTransientFailureTtl = std::chrono::seconds(20);
 constexpr size_t kMaxFormerNames = 4096;
 
 struct ObjectEntry {
@@ -342,32 +348,136 @@ public:
 
   const FileCache& cache() const { return cache_; }
 
-  // Hydrate-on-open: cache hit or mint + pinned fetch.
-  std::optional<std::filesystem::path> hydrate(const FileEntry& e, std::string& err) {
+  // Hydrate-on-open: cache hit, or a single fetch shared by every waiter.
+  //
+  // Two problems this solves beyond the plain fetch. First, browsing a folder
+  // makes Explorer open the same file repeatedly -- without SINGLE-FLIGHT
+  // that became a stampede of identical downloads. Second, a row whose blob
+  // the daemon does not have can never succeed, so NEGATIVE CACHING stops
+  // dozens of doomed round-trips (each paying a connect timeout per endpoint)
+  // and lets the namespace mark the file as unavailable rather than pretend.
+  struct HydrateResult {
+    std::optional<std::filesystem::path> path;
+    FetchFailure failure = FetchFailure::None;
+    std::string error;
+  };
+
+  HydrateResult hydrate(const FileEntry& e) {
+    HydrateResult out;
     if (!e.location.starts_with("sha256:")) {
-      err = "not daemon-backed";
-      return std::nullopt;
+      out.failure = FetchFailure::NotFound;
+      out.error = "not daemon-backed";
+      return out;
     }
     auto dest = cache_.path_for(e.location);
-    if (cache_.present(e.location)) return dest;
-    auto grant = ws_.get_file_token(e.guid);
+    if (cache_.present(e.location)) {
+      out.path = dest;
+      return out;
+    }
+    if (auto known = known_bad(e.location)) {
+      out.failure = *known;
+      out.error = "recently failed";
+      return out;
+    }
+
+    // Single-flight: one fetch per hash, everyone else waits for it.
+    std::unique_lock lock(fetch_mutex_);
+    while (in_flight_.count(e.location)) {
+      fetch_cv_.wait(lock);
+      if (cache_.present(e.location)) {
+        out.path = dest;
+        return out;
+      }
+      if (auto known = known_bad(e.location)) {
+        out.failure = *known;
+        out.error = "recently failed";
+        return out;
+      }
+    }
+    in_flight_.insert(e.location);
+    lock.unlock();
+
+    auto finish = [&]() {
+      std::lock_guard done(fetch_mutex_);
+      in_flight_.erase(e.location);
+      fetch_cv_.notify_all();
+    };
+
+    nlohmann::json grant;
+    try {
+      grant = ws_.get_file_token(e.guid);
+    } catch (const std::exception& ex) {
+      out.failure = FetchFailure::Transient;
+      out.error = ex.what();
+      note_bad(e.location, out.failure);
+      finish();
+      return out;
+    }
     if (!grant.contains("result")) {
-      err = grant.value("error", "grant refused");
-      return std::nullopt;
+      out.error = grant.value("error", "grant refused");
+      // The server refusing because the row is not daemon-backed is permanent;
+      // anything else (no file service, bridge trouble) may recover.
+      out.failure = out.error.find("not daemon-backed") != std::string::npos
+                        ? FetchFailure::NotFound
+                        : FetchFailure::Transient;
+      note_bad(e.location, out.failure);
+      finish();
+      return out;
     }
     auto res = grant["result"];
     if (res.value("mode", "") != "direct") {
-      err = "direct byte plane unavailable";
-      return std::nullopt;
+      out.failure = FetchFailure::Transient;
+      out.error = "direct byte plane unavailable";
+      note_bad(e.location, out.failure);
+      finish();
+      return out;
     }
     auto fetch = fetch_blob(res.value("urls", std::vector<std::string>{}),
                             res.value("fingerprint", ""), e.location,
                             res.value("token", ""), dest);
     if (!fetch.ok) {
-      err = fetch.error;
+      out.failure = fetch.failure;
+      out.error = fetch.error;
+      note_bad(e.location, out.failure);
+      finish();
+      return out;
+    }
+    forget_bad(e.location);
+    finish();
+    out.path = dest;
+    return out;
+  }
+
+  // Content this mount has already failed to fetch. Missing blobs are
+  // remembered far longer than blips: a dangling row will not heal, while a
+  // daemon that was briefly unreachable should be retried soon.
+  std::optional<FetchFailure> known_bad(const std::string& location) {
+    std::lock_guard lock(bad_mutex_);
+    auto it = bad_.find(location);
+    if (it == bad_.end()) return std::nullopt;
+    auto age = std::chrono::steady_clock::now() - it->second.when;
+    auto ttl = it->second.failure == FetchFailure::NotFound ? kMissingBlobTtl
+                                                            : kTransientFailureTtl;
+    if (age > ttl) {
+      bad_.erase(it);
       return std::nullopt;
     }
-    return dest;
+    return it->second.failure;
+  }
+  void note_bad(const std::string& location, FetchFailure f) {
+    std::lock_guard lock(bad_mutex_);
+    if (bad_.size() > 4096) bad_.clear();
+    bad_[location] = BadBlob{f, std::chrono::steady_clock::now()};
+  }
+  void forget_bad(const std::string& location) {
+    std::lock_guard lock(bad_mutex_);
+    bad_.erase(location);
+  }
+  // True when this content is known to be permanently absent -- the namespace
+  // marks such files OFFLINE so they do not look like ordinary readable data.
+  bool content_missing(const std::string& location) {
+    auto k = known_bad(location);
+    return k && *k == FetchFailure::NotFound;
   }
 
 private:
@@ -399,6 +509,19 @@ private:
   std::mutex mutex_;
   std::map<std::string, ObjectsCache> objects_;
   std::map<std::string, TreeCache> trees_;
+
+  // Single-flight downloads.
+  std::mutex fetch_mutex_;
+  std::condition_variable fetch_cv_;
+  std::set<std::string> in_flight_;
+
+  // Negative cache for content that could not be fetched.
+  struct BadBlob {
+    FetchFailure failure;
+    std::chrono::steady_clock::time_point when;
+  };
+  std::mutex bad_mutex_;
+  std::map<std::string, BadBlob> bad_;
 };
 
 // ---------------------------------------------------------------------------
@@ -602,6 +725,10 @@ void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
     info->FileAttributes = (r.file->ephemeral || r.file->can_write)
                                ? FILE_ATTRIBUTE_ARCHIVE
                                : FILE_ATTRIBUTE_READONLY;
+    // Content we know the file service does not have: show it as offline
+    // rather than as ordinary readable data (it opens with a real error).
+    if (!r.file->ephemeral && g_vol.ns && g_vol.ns->content_missing(r.file->location))
+      info->FileAttributes |= FILE_ATTRIBUTE_OFFLINE;
     info->FileSize = r.file->size;
     info->AllocationSize = (r.file->size + 4095) / 4096 * 4096;
     uint64_t mt = parse_timestamp(r.file->modified_on, t0);
@@ -920,6 +1047,8 @@ void write_back(FsContext* ctx) {
     if (!g_vol.ns->add_file(ctx->res.table, ctx->res.object, ctx->res.inner, hash,
                             ctx->mimetype, size, err))
       error("add " + ctx->res.inner + ": " + err);
+    else
+      info("created " + ctx->res.inner + " (" + std::to_string(size) + " bytes)");
     return;
   }
 
@@ -1019,12 +1148,19 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
         (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0;
     if (wants_write && !r->file->can_write) return STATUS_ACCESS_DENIED;
 
-    std::string err;
-    auto local = g_vol.ns->hydrate(*r->file, err);
-    if (!local) {
-      warn("hydrate " + r->file->path + ": " + err);
-      return STATUS_IO_DEVICE_ERROR;
+    auto h = g_vol.ns->hydrate(*r->file);
+    if (!h.path) {
+      // Report what is actually wrong. STATUS_IO_DEVICE_ERROR reads to users
+      // as failing hardware; neither of these is that.
+      if (h.failure == FetchFailure::NotFound) {
+        warn("content missing for " + r->file->path + " (" + h.error +
+             ") -- the attachment row points at bytes the file service does not have");
+        return STATUS_FILE_CORRUPT_ERROR;   // "corrupted and unreadable"
+      }
+      warn("hydrate " + r->file->path + ": " + h.error);
+      return STATUS_UNEXPECTED_NETWORK_ERROR;
     }
+    auto local = h.path;
     ctx->res.inner = r->file->path;
     ctx->guid = r->file->guid;
     ctx->base_hash = r->file->location;
@@ -1032,6 +1168,7 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
 
     if (wants_write) {
       // Copy up: writes never touch the shared, immutable cache blob.
+      std::string err;
       if (!open_work(ctx.get(), *local, err)) {
         warn("copy-up " + r->file->path + ": " + err);
         return STATUS_IO_DEVICE_ERROR;
@@ -1365,6 +1502,7 @@ int run_mount(const Options& o) {
   }
   ws.refresh_client_token(o.token);  // slide expiry on every mount
   FileCache cache;
+  sweep_stale_parts(cache.root());
   std::string table = o.table.empty() ? "workorders" : o.table;
   NamespaceService ns(ws, cache, {table});
   std::string err;

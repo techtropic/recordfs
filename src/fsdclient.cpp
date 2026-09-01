@@ -15,6 +15,9 @@
 #include <openssl/x509.h>
 
 #include <chrono>
+#include <mutex>
+#include <map>
+#include <atomic>
 #include <fstream>
 #include <regex>
 
@@ -73,9 +76,59 @@ bool parse_https_url(const std::string& url, UrlParts& out) {
   return true;
 }
 
+// Endpoint health: an advertised URL that is unreachable costs a full connect
+// timeout on EVERY fetch (a laptop away from that LAN pays it every time).
+// Remember recent failures and try known-good endpoints first. A cooled-down
+// endpoint is retried, so this is ordering, never exclusion.
+constexpr auto kEndpointCooldown = std::chrono::seconds(60);
+
+std::mutex& health_mutex() { static std::mutex m; return m; }
+std::map<std::string, std::chrono::steady_clock::time_point>& endpoint_failures() {
+  static std::map<std::string, std::chrono::steady_clock::time_point> m;
+  return m;
+}
+void note_endpoint_failure(const std::string& url) {
+  std::lock_guard lock(health_mutex());
+  endpoint_failures()[url] = std::chrono::steady_clock::now();
+}
+void note_endpoint_success(const std::string& url) {
+  std::lock_guard lock(health_mutex());
+  endpoint_failures().erase(url);
+}
+// Advertised URLs, healthy ones first; original order is preserved within
+// each group so a configured preference still wins.
+std::vector<std::string> by_health(const std::vector<std::string>& urls) {
+  std::lock_guard lock(health_mutex());
+  auto now = std::chrono::steady_clock::now();
+  std::vector<std::string> good, cooling;
+  for (const auto& u : urls) {
+    auto it = endpoint_failures().find(u);
+    if (it != endpoint_failures().end() && now - it->second < kEndpointCooldown)
+      cooling.push_back(u);
+    else
+      good.push_back(u);
+  }
+  good.insert(good.end(), cooling.begin(), cooling.end());
+  return good;
+}
+
+// A temp name unique to THIS fetch. A shared "<blob>.part" made concurrent
+// fetches of the same hash collide: one lost with a sharing violation (so an
+// application saw an I/O error on a perfectly good file), and cleanup on one
+// path could delete an in-flight download belonging to another.
+std::filesystem::path unique_part(const std::filesystem::path& dest) {
+  static std::atomic<uint64_t> seq{0};
+  std::filesystem::path tmp = dest;
+  tmp += ".part." + std::to_string(::GetCurrentProcessId()) + "." +
+         std::to_string(seq.fetch_add(1));
+  return tmp;
+}
+
 bool fetch_one(const UrlParts& u, const std::string& fingerprint, const std::string& hash,
                const std::string& bearer, const std::filesystem::path& dest,
-               uint64_t& size_out, std::string& err) {
+               uint64_t& size_out, std::string& err, bool& not_found) {
+  not_found = false;
+  std::filesystem::path tmp;
   try {
     asio::io_context ioc;
     ssl::context ctx(ssl::context::tls_client);
@@ -102,40 +155,59 @@ bool fetch_one(const UrlParts& u, const std::string& fingerprint, const std::str
     beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(120));
     http::write(stream, req);
 
-    // Stream the body straight to a temp file next to dest.
-    std::filesystem::path tmp = dest;
-    tmp += ".part";
+    // HEADER FIRST: check the status before opening any file, so error
+    // bodies never transit the cache directory.
     beast::flat_buffer buffer;
     http::response_parser<http::file_body> parser;
     parser.body_limit(1ull << 40);
     beast::error_code ec;
+    http::read_header(stream, buffer, parser, ec);
+    if (ec) { err = "read header: " + ec.message(); return false; }
+    auto status = parser.get().result_int();
+    if (status != 200) {
+      err = "HTTP " + std::to_string(status);
+      not_found = (status == 404);
+      return false;
+    }
+
+    tmp = unique_part(dest);
     parser.get().body().open(tmp.string().c_str(), beast::file_mode::write, ec);
     if (ec) { err = "open " + tmp.string() + ": " + ec.message(); return false; }
     http::read(stream, buffer, parser);
     parser.get().body().close();
 
-    auto status = parser.get().result_int();
-    if (status != 200) {
-      std::filesystem::remove(tmp);
-      err = "HTTP " + std::to_string(status);
-      return false;
-    }
-
     // Verify content addressing end-to-end before the file becomes visible.
     std::string got = sha256_hex_of_file(tmp);
     std::string want = hash.starts_with("sha256:") ? hash.substr(7) : hash;
     if (got != want) {
-      std::filesystem::remove(tmp);
+      std::error_code rc;
+      std::filesystem::remove(tmp, rc);
       err = "content hash mismatch after download";
       return false;
     }
     size_out = std::filesystem::file_size(tmp);
-    std::filesystem::rename(tmp, dest);
+    // A concurrent fetch of the same blob may have published first; identical
+    // content makes either winner correct.
+    std::error_code rec;
+    std::filesystem::rename(tmp, dest, rec);
+    if (rec) {
+      std::error_code rc;
+      bool published = std::filesystem::exists(dest);
+      std::filesystem::remove(tmp, rc);
+      if (!published) {
+        err = "publish: " + rec.message();
+        return false;
+      }
+    }
 
     beast::error_code sec;
     stream.shutdown(sec);  // best-effort TLS close
     return true;
   } catch (const std::exception& e) {
+    if (!tmp.empty()) {
+      std::error_code rc;
+      std::filesystem::remove(tmp, rc);
+    }
     err = e.what();
     return false;
   }
@@ -250,26 +322,62 @@ FetchResult fetch_blob(const std::vector<std::string>& urls, const std::string& 
                        const std::string& hash, const std::string& bearer,
                        const std::filesystem::path& dest) {
   FetchResult r;
-  if (urls.empty()) { r.error = "no advertised urls"; return r; }
-  if (fingerprint.size() != 64) { r.error = "no pinned fingerprint"; return r; }
+  if (urls.empty()) {
+    r.error = "no advertised urls";
+    r.failure = FetchFailure::Transient;
+    return r;
+  }
+  if (fingerprint.size() != 64) {
+    r.error = "no pinned fingerprint";
+    r.failure = FetchFailure::Transient;
+    return r;
+  }
   std::filesystem::create_directories(dest.parent_path());
   auto t0 = std::chrono::steady_clock::now();
-  for (const auto& url : urls) {
+  bool answered = false, all_not_found = true;
+  for (const auto& url : by_health(urls)) {
     UrlParts u;
     if (!parse_https_url(url, u)) {
       r.error += (r.error.empty() ? "" : "; ") + url + ": unsupported url";
       continue;
     }
     std::string err;
-    if (fetch_one(u, fingerprint, hash, bearer, dest, r.size, err)) {
+    bool not_found = false;
+    if (fetch_one(u, fingerprint, hash, bearer, dest, r.size, err, not_found)) {
+      note_endpoint_success(url);
       r.ok = true;
       r.url_used = url;
       r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       return r;
     }
+    if (not_found) {
+      answered = true;
+      note_endpoint_success(url);   // it responded; the content is simply gone
+    } else {
+      all_not_found = false;
+      note_endpoint_failure(url);   // reachability problem, not a missing blob
+    }
     r.error += (r.error.empty() ? "" : "; ") + url + ": " + err;
   }
+  // Only when every endpoint that answered said 404 is the blob really gone.
+  r.failure = (answered && all_not_found) ? FetchFailure::NotFound : FetchFailure::Transient;
   return r;
+}
+
+void sweep_stale_parts(const std::filesystem::path& cache_root) {
+  std::error_code ec;
+  if (!std::filesystem::exists(cache_root, ec)) return;
+  size_t removed = 0;
+  for (auto it = std::filesystem::recursive_directory_iterator(cache_root, ec);
+       it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+    if (ec) break;
+    if (!it->is_regular_file(ec)) continue;
+    if (it->path().string().find(".part.") == std::string::npos) continue;
+    std::error_code rc;
+    if (std::filesystem::remove(it->path(), rc)) ++removed;
+  }
+  if (removed)
+    info("swept " + std::to_string(removed) + " abandoned download(s) from the cache");
 }
 
 }  // namespace rfs

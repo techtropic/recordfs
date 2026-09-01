@@ -13,13 +13,27 @@ namespace rfs {
 // of the peer's DER certificate must equal the server-vouched value; CA
 // chain and hostname are irrelevant). Downloaded bytes are SHA-256-verified
 // against the requested hash before the destination file appears.
+// Why a fetch failed. The distinction is user-visible: content the daemon
+// does not have is PERMANENTLY gone (a dangling attachment row), while a
+// refused connection is transient -- reporting both as a device error reads
+// to users like failing hardware.
+enum class FetchFailure {
+  None,
+  NotFound,    // every endpoint answered 404: the blob is not there
+  Transient,   // unreachable / TLS / timeout / bad grant
+};
+
 struct FetchResult {
   bool ok = false;
+  FetchFailure failure = FetchFailure::None;
   std::string error;      // per-url failures, joined
   std::string url_used;   // which advertised url succeeded
   uint64_t size = 0;
   double ms = 0;          // transfer time
 };
+
+// Remove abandoned *.part files (a killed agent leaves them behind).
+void sweep_stale_parts(const std::filesystem::path& cache_root);
 
 // Upload result for the write-back engine. `hash` is the content id the
 // daemon stored the bytes under -- the value an attachment row is re-pointed
