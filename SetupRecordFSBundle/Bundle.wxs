@@ -39,6 +39,11 @@
                          Variable="VCRedistInstalled"
                          Result="value" />
 
+    <!-- Bundle variables of the same names, so they can be supplied on the
+         bundle command line and forwarded to the MSI below. -->
+    <Variable Name="DriveLetter" Value="S:" Type="string" bal:Overridable="yes" />
+    <Variable Name="VolumeLabel" Value="Records" Type="string" bal:Overridable="yes" />
+
     <Chain>
       <ExePackage Id="VCRedist"
                   SourceFile="redist\vc_redist.x64.exe"
@@ -65,7 +70,13 @@
                   Compressed="yes" />
       <MsiPackage Id="RecordFSMsi"
                   SourceFile="$(var.SetupRecordFS.TargetPath)"
-                  Compressed="yes" />
+                  Compressed="yes">
+        <!-- Pass the deployment settings through to the MSI, so
+             RecordFSSetup.exe DRIVELETTER=R: VOLUMELABEL="Job Records"
+             works exactly like the msiexec form. -->
+        <MsiProperty Name="DRIVELETTER" Value="[DriveLetter]" />
+        <MsiProperty Name="VOLUMELABEL" Value="[VolumeLabel]" />
+      </MsiPackage>
     </Chain>
   </Bundle>
 </Wix>

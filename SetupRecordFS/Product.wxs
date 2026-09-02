@@ -41,12 +41,26 @@
       <![CDATA[Installed OR WINFSPINSTALLED]]>
     </Condition>
 
+    <!-- Deployment settings. Both are settable on the command line:
+           msiexec /i RecordFS.msi DRIVELETTER=R: VOLUMELABEL="Job Records"
+         and through the bundle:
+           RecordFSSetup.exe DRIVELETTER=R: VOLUMELABEL="Job Records"
+         They are written to HKLM\SOFTWARE\RecordFS as machine policy; the
+         agent falls back to S: and "Records" when they are absent, and a
+         per-user credential profile, or an explicit drive/volume switch on
+         the agent command line, still wins over the machine default. Secure="yes" lets the values survive
+         an elevated (UAC) install, where the UI and execute sequences run in
+         different processes. -->
+    <Property Id="DRIVELETTER" Value="S:" Secure="yes" />
+    <Property Id="VOLUMELABEL" Value="Records" Secure="yes" />
+
     <WixVariable Id="WixUILicenseRtf" Value="..\lic.rtf" />
 
     <Feature Id="ProductFeature" Title="RecordFS" Level="1" ConfigurableDirectory="INSTALLFOLDER">
       <ComponentGroupRef Id="ProgramFiles" />
       <ComponentGroupRef Id="PathEntry" />
       <ComponentGroupRef Id="Autostart" />
+      <ComponentGroupRef Id="DriveSettings" />
     </Feature>
 
     <UIRef Id="WixUI_InstallDir" />
@@ -74,6 +88,19 @@
       </Component>
       <Component Id="license" Guid="*" Win64="yes">
         <File Id="license" Source="..\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Machine policy for the drive letter and volume label. Kept in its own
+       component so a repair restores it and an uninstall removes it. -->
+  <Fragment>
+    <ComponentGroup Id="DriveSettings" Directory="INSTALLFOLDER">
+      <Component Id="drive_settings" Guid="5C1B7E94-2A38-4D61-9F0C-6E3A81D24B75" Win64="yes" KeyPath="yes">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\RecordFS">
+          <RegistryValue Name="DriveLetter" Type="string" Value="[DRIVELETTER]" />
+          <RegistryValue Name="VolumeLabel" Type="string" Value="[VOLUMELABEL]" />
+        </RegistryKey>
       </Component>
     </ComponentGroup>
   </Fragment>

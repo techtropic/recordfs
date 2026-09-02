@@ -101,6 +101,10 @@ uint64_t parse_timestamp(const std::string& s, uint64_t fallback) {
 // Long enough to cover an edit-and-save session that straddles a rename;
 // short enough that a name freed by a rename becomes genuinely free soon.
 constexpr auto kFormerNameGrace = std::chrono::minutes(10);
+// The set of tables holding attachments changes rarely; the root listing asks
+// often. Long enough to be cheap, short enough that a newly attached-to table
+// shows up without a remount.
+constexpr auto kTableListTtl = std::chrono::seconds(60);
 // A blob the daemon does not have will not appear on its own; a daemon that
 // was briefly unreachable will. Remember the former far longer.
 constexpr auto kMissingBlobTtl = std::chrono::minutes(10);
@@ -116,14 +120,41 @@ struct ObjectEntry {
 
 class NamespaceService {
 public:
-  NamespaceService(WsClient& ws, FileCache& cache, std::vector<std::string> tables)
-      : ws_(ws), cache_(cache), tables_(std::move(tables)), mount_time_(now_filetime()) {}
+  NamespaceService(WsClient& ws, FileCache& cache)
+      : ws_(ws), cache_(cache), mount_time_(now_filetime()) {}
 
   uint64_t mount_time() const { return mount_time_; }
-  const std::vector<std::string>& tables() const { return tables_; }
 
-  bool is_table(const std::string& name) const {
-    for (const auto& t : tables_)
+  // The root listing. Tables are DISCOVERED from the server -- any table
+  // holding at least one attachment that this user may read -- so a table
+  // appears by itself once its first attachment is added, and no fixed list
+  // has to be maintained anywhere.
+  std::vector<std::string> tables() {
+    std::lock_guard lock(tables_mutex_);
+    auto now = std::chrono::steady_clock::now();
+    if (tables_.empty() || fetched_tables_ + kTableListTtl < now) {
+      try {
+        auto r = ws_.list_tables();
+        std::vector<std::string> found;
+        for (const auto& t : r.value("tables", nlohmann::json::array())) {
+          std::string name = t.value("table", "");
+          if (!name.empty()) found.push_back(name);
+        }
+        // Keep the previous list on an empty/failed answer rather than making
+        // the whole drive look empty.
+        if (!found.empty() || !tables_.empty()) {
+          if (!found.empty()) tables_ = std::move(found);
+          fetched_tables_ = now;
+        }
+      } catch (const std::exception& e) {
+        warn(std::string("list_tables: ") + e.what());
+      }
+    }
+    return tables_;
+  }
+
+  bool is_table(const std::string& name) {
+    for (const auto& t : tables())
       if (lower_ascii(t) == lower_ascii(name)) return true;
     return false;
   }
@@ -504,8 +535,11 @@ private:
 
   WsClient& ws_;
   FileCache& cache_;
-  std::vector<std::string> tables_;
   uint64_t mount_time_;
+  std::mutex tables_mutex_;
+  std::vector<std::string> tables_;
+  std::chrono::steady_clock::time_point fetched_tables_{};
+
   std::mutex mutex_;
   std::map<std::string, ObjectsCache> objects_;
   std::map<std::string, TreeCache> trees_;
@@ -709,6 +743,7 @@ bool is_ephemeral_name(const std::string& leaf) {
 struct Volume {
   NamespaceService* ns = nullptr;
   FSP_FILE_SYSTEM* fs = nullptr;
+  std::wstring label;
   PSECURITY_DESCRIPTOR sd = nullptr;
   ULONG sd_size = 0;
 };
@@ -743,9 +778,13 @@ void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
 NTSTATUS SvcGetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* v) {
   v->TotalSize = 1ull << 40;
   v->FreeSize = 1ull << 39;
-  const wchar_t label[] = L"RecordFS";
-  std::memcpy(v->VolumeLabel, label, sizeof(label));
-  v->VolumeLabelLength = (UINT16)(sizeof(label) - sizeof(wchar_t));
+  // Configurable label (installer policy / --volume); the field is a fixed
+  // 32-WCHAR buffer, so a long name is truncated rather than overrunning.
+  std::wstring label = g_vol.label.empty() ? L"Records" : g_vol.label;
+  const size_t max_chars = sizeof(v->VolumeLabel) / sizeof(WCHAR) - 1;
+  if (label.size() > max_chars) label.resize(max_chars);
+  std::memcpy(v->VolumeLabel, label.c_str(), (label.size() + 1) * sizeof(WCHAR));
+  v->VolumeLabelLength = (UINT16)(label.size() * sizeof(WCHAR));
   return STATUS_SUCCESS;
 }
 
@@ -1404,6 +1443,7 @@ BOOL WINAPI ctrl_handler(DWORD) {
 // NamespaceService must outlive the returned filesystem.
 static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std::string& err) {
   g_vol.ns = &ns;
+  g_vol.label = widen(o.volume);
 
   // Everyone-full-access descriptor; real authorization lives server-side in
   // the per-user session (durable files stay per-file read-only regardless).
@@ -1430,7 +1470,7 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
   // until the P2 write-back engine.
   params.PostCleanupWhenModifiedOnly = 1;
   params.UmFileContextIsUserContext2 = 1;
-  wcscpy_s(params.FileSystemName, L"RecordFS");
+  wcscpy_s(params.FileSystemName, L"RecordFS");  // filesystem TYPE, not the label
 
   static FSP_FILE_SYSTEM_INTERFACE iface = {};
   iface.GetVolumeInfo = SvcGetVolumeInfo;
@@ -1478,7 +1518,7 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
     FspFileSystemDelete(fs);
     return nullptr;
   }
-  info("mounted " + o.drive + "\\ — server " + o.server);
+  info("mounted " + o.drive + " -- server " + o.server);
   return fs;
 }
 
@@ -1503,8 +1543,7 @@ int run_mount(const Options& o) {
   ws.refresh_client_token(o.token);  // slide expiry on every mount
   FileCache cache;
   sweep_stale_parts(cache.root());
-  std::string table = o.table.empty() ? "workorders" : o.table;
-  NamespaceService ns(ws, cache, {table});
+  NamespaceService ns(ws, cache);
   std::string err;
   FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
   if (!fs) {
@@ -1547,6 +1586,7 @@ int run_agent(const Options& base) {
       if (stopped(60000)) return 0;
       continue;
     }
+    resolve_drive_settings(o);   // profile first, then machine policy
     try {
       WsClient ws(o.server, o.insecure);
       if (!ws.login(o.token)) {
@@ -1556,8 +1596,7 @@ int run_agent(const Options& base) {
       }
       ws.refresh_client_token(o.token);
       FileCache cache;
-      std::string table = o.table.empty() ? "workorders" : o.table;
-      NamespaceService ns(ws, cache, {table});
+      NamespaceService ns(ws, cache);
       std::string err;
       FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
       if (!fs) throw std::runtime_error(err);

@@ -12,7 +12,8 @@ struct Options {
   std::string server;             // ws://host:port/
   std::string token;              // mount token (plaintext)
   std::string profile = "default";
-  std::string drive = "S:";
+  std::string drive;    // resolved by resolve_drive_settings()
+  std::string volume;   // volume label shown in Explorer
   std::string table;              // probe: focus table (default workorders)
   std::string key;                // probe: focus record key
   bool verbose = false;
@@ -29,6 +30,15 @@ bool resolve_credentials(Options& o);
 // Persist / erase the credential profile (store-token, erase-token).
 bool store_credentials(const Options& o);
 bool erase_credentials(const Options& o);
+
+// Drive letter and volume label, in precedence order:
+//   1. --drive / --volume on the command line
+//   2. the per-user credential profile (what the desktop wrote at login)
+//   3. machine policy: HKLM\\SOFTWARE\\RecordFS DriveLetter / VolumeLabel
+//      (set by the installer, including from its command line)
+//   4. built-in defaults (S: and "Records")
+// Call after resolve_credentials so a stored profile can contribute.
+void resolve_drive_settings(Options& o);
 
 void print_usage();
 

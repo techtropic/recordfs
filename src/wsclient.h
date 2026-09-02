@@ -36,6 +36,9 @@ public:
   nlohmann::json request(const std::string& name, nlohmann::json data);
 
   // Convenience wrappers (shapes per docs/protocol.md §4/§6.1).
+  // Tables that have at least one attachment and that this user may read
+  // (protocol docs section 4.0). The mount root is discovered, not configured.
+  nlohmann::json list_tables();
   nlohmann::json list_objects(const std::string& table, size_t start = 0, size_t count = 0);
   nlohmann::json list_files(const std::string& table, const std::string& key_type,
                             const nlohmann::json& key);

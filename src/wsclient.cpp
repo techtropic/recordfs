@@ -185,6 +185,10 @@ nlohmann::json WsClient::request(const std::string& name, nlohmann::json data) {
   }
 }
 
+nlohmann::json WsClient::list_tables() {
+  return request("list_tables", nlohmann::json::object());
+}
+
 nlohmann::json WsClient::list_objects(const std::string& table, size_t start, size_t count) {
   nlohmann::json d;
   d["table"] = table;

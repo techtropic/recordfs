@@ -16,8 +16,12 @@ void print_usage() {
     "                       [--table workorders] [--key 50049] [-v] [--insecure]\n"
     "  recordfs store-token  --server ws://host:port/ --token T [--drive S:] [--profile P]\n"
     "  recordfs erase-token [--profile P]\n"
-    "  recordfs mount       [--profile P] [--drive S:]\n"
-    "  recordfs agent       [--profile P]   (logon autostart: supervise + mount + retry)\n");
+    "  recordfs mount       [--profile P] [--drive S:] [--volume Records]\n"
+    "  recordfs agent       [--profile P]   (logon autostart: supervise + mount + retry)\n"
+    "\n"
+    "drive letter and volume label default to machine policy\n"
+    "(HKLM\\SOFTWARE\\RecordFS DriveLetter / VolumeLabel, set by the installer)\n"
+    "and fall back to S: and \"Records\".\n");
 }
 
 std::optional<Options> parse_args(int argc, char** argv) {
@@ -34,6 +38,7 @@ std::optional<Options> parse_args(int argc, char** argv) {
     else if (a == "--token")  { auto* v = need("--token");   if (!v) return std::nullopt; o.token = v; }
     else if (a == "--profile"){ auto* v = need("--profile"); if (!v) return std::nullopt; o.profile = v; }
     else if (a == "--drive")  { auto* v = need("--drive");   if (!v) return std::nullopt; o.drive = v; }
+    else if (a == "--volume") { auto* v = need("--volume");  if (!v) return std::nullopt; o.volume = v; }
     else if (a == "--table")  { auto* v = need("--table");   if (!v) return std::nullopt; o.table = v; }
     else if (a == "--key")    { auto* v = need("--key");     if (!v) return std::nullopt; o.key = v; }
     else if (a == "-v" || a == "--verbose") { o.verbose = true; }

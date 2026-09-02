@@ -67,8 +67,15 @@ int run_supervisor(const rfs::Options& o) {
   for (;;) {
     // The worker opens its own agent.log (attach_parent_console handles the
     // redirect) — handle inheritance into a GUI-subsystem CRT is unreliable.
+    // Forward what the worker cannot rediscover. Drive and volume normally
+    // come from machine policy or the stored profile, but an explicit switch
+    // on the agent command line must still win.
     std::wstring cmd = L"\"" + own_path() + L"\" agent-run --profile " +
                        std::wstring(o.profile.begin(), o.profile.end());
+    if (!o.drive.empty())
+      cmd += L" --drive " + std::wstring(o.drive.begin(), o.drive.end());
+    if (!o.volume.empty())
+      cmd += L" --volume \"" + std::wstring(o.volume.begin(), o.volume.end()) + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -98,7 +105,11 @@ int main(int argc, char** argv) {
       rfs::print_usage();
       return 0;
     }
-    if (o.command == "store-token") return rfs::store_credentials(o) ? 0 : 1;
+    if (o.command == "store-token") {
+      // Record whatever the caller asked for, filled in from machine policy.
+      rfs::resolve_drive_settings(o);
+      return rfs::store_credentials(o) ? 0 : 1;
+    }
     if (o.command == "erase-token") return rfs::erase_credentials(o) ? 0 : 1;
     if (o.command == "probe") {
       if (!rfs::resolve_credentials(o)) return 1;
@@ -109,6 +120,9 @@ int main(int argc, char** argv) {
 #ifdef RECORDFS_HAVE_WINFSP
       if (o.command == "agent-run") return rfs::run_agent(o);
       if (!rfs::resolve_credentials(o)) return 1;
+      // AFTER credentials: a stored profile may carry drive/volume, and it
+      // only wins over machine policy if the defaults have not been applied.
+      rfs::resolve_drive_settings(o);
       return rfs::run_mount(o);
 #else
       rfs::error("this build has no mount support (WinFsp SDK was not present at build time)");
