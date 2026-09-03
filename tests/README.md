@@ -55,3 +55,13 @@ What real applications actually do:
 
 Both need the same setup as `rename_grace_e2e.py` and leave the record exactly
 as they found it.
+
+## table_write_gate_e2e.py
+
+Table-level write permission enforcement, run as a RESTRICTED user (a mount
+token minted for a user who can read a table but not write it). Checks that
+list_tables reports can_write=false for the read-only table, add_attachment
+on it is refused with a read-only reason, and the same operation on a
+writable table succeeds. Needs the restricted user (in the testing DB:
+rotest, read-only on quote) and its mount token in
+%TEMP%otest_tok.txt.
