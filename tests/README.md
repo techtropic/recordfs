@@ -72,7 +72,8 @@ otest_tok.txt.
 The lock-file asymmetry on a table the user may read but not write: an
 ephemeral lock file is accepted and visible to other sessions, while a
 durable attachment write on the same record is refused. Run as a restricted
-user (rotest in the testing DB) with its mount token in %TEMP%otest_tok.txt.
+user (rotest in the testing DB) with its mount token in %TEMP%
+otest_tok.txt.
 
 ## multireader_e2e.py
 
@@ -83,9 +84,20 @@ the handle metadata likewise does not change, but that a fresh stat BY PATH
 picks up the new size once the file-tree TTL rolls and a fresh open reads the
 new bytes.
 
-NOTE on change notification: WinFsp raises watcher events for changes made
-through THIS machine driver, so a local edit is noticed normally. A PEER
-change raises none -- nothing tells this machine driver about it -- so an
-application that only listens will not learn of it, while one that re-stats
-the path will within the TTL. Surfacing peer changes needs
-FspFileSystemNotify, which is not implemented.
+NOTE on change notification: local edits are notified by the WinFsp driver
+itself. Peer edits are surfaced by the notify pump (see
+peer_notify_probe.ps1). An open handle still keeps the version it opened --
+that is deliberate, and matches what a real share does when a file is
+replaced rather than written in place.
+
+## peer_notify_probe.ps1 (+ peer_change.py)
+
+A peer replaces a file over the wire, never touching this machine filesystem,
+and the probe asserts a directory watcher sees a change event and a reopen
+reads the new bytes. Run it with the mount up.
+
+## dedup_transparency_e2e.py
+
+Two attachments with byte-identical content share one blob. Editing one must
+produce a new hash and re-point only that row, leaving the other file exactly
+as it was -- the property that lets deduplication stay invisible to users.

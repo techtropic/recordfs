@@ -35,6 +35,7 @@ typedef NTSTATUS* PNTSTATUS;
 
 #include <algorithm>
 #include <chrono>
+#include <cwctype>
 #include <set>
 #include <condition_variable>
 #include <map>
@@ -44,6 +45,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace rfs {
@@ -105,6 +107,12 @@ constexpr auto kFormerNameGrace = std::chrono::minutes(10);
 // often. Long enough to be cheap, short enough that a newly attached-to table
 // shows up without a remount.
 constexpr auto kTableListTtl = std::chrono::seconds(60);
+// How often the notify pump re-reads an active record, and how long a record
+// stays active after it was last touched. A peer's save has to be noticed by
+// polling: attachments have no change stream, so this interval IS the
+// staleness bound an application sees.
+constexpr auto kNotifyPollInterval = std::chrono::seconds(5);
+constexpr auto kActiveRecordLinger = std::chrono::minutes(2);
 // A blob the daemon does not have will not appear on its own; a daemon that
 // was briefly unreachable will. Remember the former far longer.
 constexpr auto kMissingBlobTtl = std::chrono::minutes(10);
@@ -117,6 +125,12 @@ struct ObjectEntry {
   bool numeric = false;
   long long id = 0;
 };
+
+// Set once the filesystem exists; the namespace layer reports peer-side
+// changes through it. Declared here because NamespaceService is defined
+// before the volume it notifies.
+void notify_change(const std::string& table, const std::string& dir_name,
+                   const std::string& inner, UINT32 action);
 
 class NamespaceService {
 public:
@@ -136,10 +150,16 @@ public:
       try {
         auto r = ws_.list_tables();
         std::vector<std::string> found;
+        std::map<std::string, bool> writable;
         for (const auto& t : r.value("tables", nlohmann::json::array())) {
           std::string name = t.value("table", "");
-          if (!name.empty()) found.push_back(name);
+          if (name.empty()) continue;
+          found.push_back(name);
+          // Absent means an older server that does not report it; assume
+          // writable and let the server refuse -- never silently read-only.
+          writable[lower_ascii(name)] = t.value("can_write", true);
         }
+        if (!writable.empty()) writable_ = std::move(writable);
         // Keep the previous list on an empty/failed answer rather than making
         // the whole drive look empty.
         if (!found.empty() || !tables_.empty()) {
@@ -157,6 +177,15 @@ public:
     for (const auto& t : tables())
       if (lower_ascii(t) == lower_ascii(name)) return true;
     return false;
+  }
+
+  // Whether this user may write ANY attachment in the table (the table-level
+  // write mask). Per-attachment masks still apply on top, via can_write.
+  bool table_writable(const std::string& name) {
+    tables();  // refresh if stale
+    std::lock_guard lock(tables_mutex_);
+    auto it = writable_.find(lower_ascii(name));
+    return it == writable_.end() ? true : it->second;
   }
 
   // Table-dir listing (one list_objects, TTL-cached).
@@ -230,13 +259,21 @@ public:
     return std::nullopt;
   }
 
-  // A record's file tree (TTL-cached per record).
+  // A record's file tree (TTL-cached per record). Touching a record marks it
+  // ACTIVE, so the notify pump keeps watching it for peer changes.
   std::shared_ptr<const FileTree> files(const std::string& table, const ObjectEntry& obj) {
+    mark_active(table, obj);
+    return files_locked(table, obj, false);
+  }
+
+  // force=true refetches regardless of TTL (the notify pump).
+  std::shared_ptr<const FileTree> files_locked(const std::string& table, const ObjectEntry& obj,
+                                               bool force) {
     std::string ck = lower_ascii(table) + "\x1f" + obj.key;
     std::lock_guard lock(mutex_);
     auto& c = trees_[ck];
     auto now = std::chrono::steady_clock::now();
-    if (!c.tree || c.fetched + std::chrono::seconds(10) < now) {
+    if (!c.tree || force || c.fetched + std::chrono::seconds(10) < now) {
       auto r = ws_.list_files(table, obj.numeric ? "id" : "guid",
                               obj.numeric ? nlohmann::json(obj.id) : nlohmann::json(obj.key));
       std::vector<FileEntry> entries;
@@ -254,10 +291,93 @@ public:
       }
       auto tree = std::make_shared<FileTree>();
       tree->build(std::move(entries));
+      // Diff against what we previously believed, so a change made by SOMEONE
+      // ELSE becomes a filesystem change notification. Changes made through
+      // this machine are notified by the WinFsp driver itself, so those are
+      // filtered out (see note_local_write) to avoid duplicate events.
+      if (c.tree) emit_tree_diff(table, obj, *c.tree, *tree);
       c.tree = std::move(tree);
       c.fetched = now;
     }
     return c.tree;
+  }
+
+  // Turn "what changed since we last looked" into filesystem notifications.
+  // Only content-bearing differences count: a file that appeared, vanished,
+  // or whose bytes moved to a different hash.
+  void emit_tree_diff(const std::string& table, const ObjectEntry& obj,
+                      const FileTree& before, const FileTree& after) {
+    std::map<std::string, const FileEntry*> old_by_path, new_by_path;
+    for (const auto& e : before.entries())
+      if (!e.is_dir) old_by_path[lower_ascii(e.path)] = &e;
+    for (const auto& e : after.entries())
+      if (!e.is_dir) new_by_path[lower_ascii(e.path)] = &e;
+
+    for (const auto& [k, e] : new_by_path) {
+      auto it = old_by_path.find(k);
+      if (it == old_by_path.end()) {
+        if (!was_local_write(table, obj.key, e->path, e->location))
+          notify_change(table, obj.dir_name, e->path, FILE_ACTION_ADDED);
+      } else if (it->second->location != e->location) {
+        if (!was_local_write(table, obj.key, e->path, e->location))
+          notify_change(table, obj.dir_name, e->path, FILE_ACTION_MODIFIED);
+      }
+    }
+    for (const auto& [k, e] : old_by_path) {
+      if (!new_by_path.count(k))
+        notify_change(table, obj.dir_name, e->path, FILE_ACTION_REMOVED);
+    }
+  }
+
+  // Remember content this machine just wrote, so the pump does not report our
+  // own save back to us as a peer change.
+  void note_local_write(const std::string& table, const ObjectEntry& obj,
+                        const std::string& inner, const std::string& location) {
+    std::lock_guard lock(local_writes_mutex_);
+    if (local_writes_.size() > 512) local_writes_.clear();
+    local_writes_[lower_ascii(table) + "\x1f" + obj.key + "\x1f" + lower_ascii(inner)] = location;
+  }
+  bool was_local_write(const std::string& table, const std::string& key,
+                       const std::string& inner, const std::string& location) {
+    std::lock_guard lock(local_writes_mutex_);
+    auto k = lower_ascii(table) + "\x1f" + key + "\x1f" + lower_ascii(inner);
+    auto it = local_writes_.find(k);
+    if (it == local_writes_.end() || it->second != location) return false;
+    local_writes_.erase(it);   // one-shot: only the write we just made
+    return true;
+  }
+
+  void mark_active(const std::string& table, const ObjectEntry& obj) {
+    std::lock_guard lock(active_mutex_);
+    active_[lower_ascii(table) + "\x1f" + obj.key] = ActiveRecord{
+        table, obj, std::chrono::steady_clock::now()};
+  }
+
+  // Poll every active record and turn peer-side changes into notifications.
+  // Runs on its own thread: an application holding a drawing open may never
+  // touch the directory again, so nothing else would drive a refresh.
+  void run_notify_pump(HANDLE stop) {
+    for (;;) {
+      if (::WaitForSingleObject(stop, (DWORD)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          kNotifyPollInterval).count()) == WAIT_OBJECT_0)
+        return;
+      std::vector<ActiveRecord> due;
+      {
+        std::lock_guard lock(active_mutex_);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = active_.begin(); it != active_.end();) {
+          if (now - it->second.touched > kActiveRecordLinger) it = active_.erase(it);
+          else { due.push_back(it->second); ++it; }
+        }
+      }
+      for (const auto& r : due) {
+        try {
+          files_locked(r.table, r.obj, true);   // refresh + diff -> notify
+        } catch (const std::exception&) {
+          // A blip must not kill the pump; the next tick retries.
+        }
+      }
+    }
   }
 
   // Ephemeral plane pass-throughs, addressed by resolved record. The record's
@@ -353,13 +473,20 @@ public:
     bool ok = ws_.add_attachment(table, o.numeric ? "id" : "guid",
                                  o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
                                  "/" + inner, location, mimetype, size, &err);
-    if (ok) invalidate_tree(table, o);
+    if (ok) {
+      if (!location.empty()) note_local_write(table, o, inner, location);
+      invalidate_tree(table, o);
+    }
     return ok;
   }
   bool repoint_file(const std::string& table, const ObjectEntry& o, const std::string& guid,
-                    const std::string& location, uint64_t size, std::string& err) {
+                    const std::string& location, uint64_t size, std::string& err,
+                    const std::string& inner = {}) {
     bool ok = ws_.update_attachment_location(guid, location, size, &err);
-    if (ok) invalidate_tree(table, o);
+    if (ok) {
+      if (!inner.empty()) note_local_write(table, o, inner, location);
+      invalidate_tree(table, o);
+    }
     return ok;
   }
   bool rename_file(const std::string& table, const ObjectEntry& o, const std::string& guid,
@@ -538,6 +665,7 @@ private:
   uint64_t mount_time_;
   std::mutex tables_mutex_;
   std::vector<std::string> tables_;
+  std::map<std::string, bool> writable_;   // lower(table) -> table write mask
   std::chrono::steady_clock::time_point fetched_tables_{};
 
   std::mutex mutex_;
@@ -556,6 +684,19 @@ private:
   };
   std::mutex bad_mutex_;
   std::map<std::string, BadBlob> bad_;
+
+  // Records the notify pump is watching (anything touched recently).
+  struct ActiveRecord {
+    std::string table;
+    ObjectEntry obj;
+    std::chrono::steady_clock::time_point touched;
+  };
+  std::mutex active_mutex_;
+  std::map<std::string, ActiveRecord> active_;
+
+  // (table, key, inner) -> content this machine just wrote.
+  std::mutex local_writes_mutex_;
+  std::map<std::string, std::string> local_writes_;
 };
 
 // ---------------------------------------------------------------------------
@@ -749,6 +890,44 @@ struct Volume {
 };
 Volume g_vol;
 
+// Report a change under <table>\<record>\<inner> to anyone watching that
+// directory. WinFsp requires the Begin/Notify/End bracket, and Begin can
+// refuse while a rename is in flight -- that is not an error, just skip this
+// round; the pump will notice the same difference next tick.
+void notify_change(const std::string& table, const std::string& dir_name,
+                   const std::string& inner, UINT32 action) {
+  if (!g_vol.fs) return;
+  std::string rel = table + "\\" + dir_name + "\\" + inner;
+  for (auto& c : rel)
+    if (c == '/') c = '\\';
+  // WinFsp requires NORMALIZED names here. This volume is case-insensitive and
+  // does not implement name normalization, for which the documented normal
+  // form is UPPER CASE -- and it is what the driver itself emits for local
+  // changes. Passing the natural case silently delivers nothing.
+  std::wstring wpath = L"\\" + widen(rel);
+  for (auto& wc : wpath) wc = (wchar_t)::towupper(wc);
+
+  NTSTATUS st = FspFileSystemNotifyBegin(g_vol.fs, 0);
+  if (!NT_SUCCESS(st)) return;   // busy (e.g. STATUS_CANT_WAIT); try next tick
+
+  // Flexible array member: stage in a byte buffer and cast (it cannot live in
+  // a union under MSVC).
+  UINT8 buf[sizeof(FSP_FSCTL_NOTIFY_INFO) + 512 * sizeof(WCHAR)] = {};
+  auto* ni = (FSP_FSCTL_NOTIFY_INFO*)buf;
+  size_t namelen = std::min<size_t>(wpath.size(), 511);
+  ni->Size = (UINT16)(sizeof(FSP_FSCTL_NOTIFY_INFO) + namelen * sizeof(WCHAR));
+  ni->Filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE |
+               FILE_NOTIFY_CHANGE_LAST_WRITE;
+  ni->Action = action;
+  std::memcpy(ni->FileNameBuf, wpath.c_str(), namelen * sizeof(WCHAR));
+  FspFileSystemNotify(g_vol.fs, ni, ni->Size);
+  FspFileSystemNotifyEnd(g_vol.fs);
+
+  const char* what = action == FILE_ACTION_ADDED ? "added"
+                   : action == FILE_ACTION_REMOVED ? "removed" : "modified";
+  info(std::string("peer change (") + what + "): " + rel);
+}
+
 void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
   std::memset(info, 0, sizeof(*info));
   uint64_t t0 = g_vol.ns->mount_time();
@@ -862,6 +1041,14 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UIN
     inner += parts[i];
   }
   std::string leaf = parts.back();
+
+  // A table the user may read but not write is read-only on the drive too.
+  // Refuse here rather than accepting the write and having the server reject
+  // it at cleanup, which would look like a save that silently vanished.
+  // Ephemeral lock/temp files stay allowed: they are coordination state, not
+  // record data, and refusing them breaks opening documents read-only.
+  const bool writable = g_vol.ns->table_writable(table);
+  if (!writable && !is_ephemeral_name(leaf)) return STATUS_ACCESS_DENIED;
 
   auto ctx = std::make_unique<FsContext>();
   ctx->res.kind = Resolved::File;
@@ -1030,6 +1217,7 @@ NTSTATUS SvcCanDelete(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR) {
   if (!ctx) return STATUS_INVALID_DEVICE_REQUEST;
   if (ctx->is_eph) return STATUS_SUCCESS;
   if (ctx->is_new) return STATUS_SUCCESS;        // never registered
+  if (!g_vol.ns->table_writable(ctx->res.table)) return STATUS_ACCESS_DENIED;
   if (ctx->res.kind == Resolved::InnerDir) {
     // A directory is a real inode/directory row; removable once empty.
     if (ctx->res.tree && !ctx->res.tree->list(ctx->res.inner).empty())
@@ -1109,7 +1297,8 @@ void write_back(FsContext* ctx) {
     error("save " + ctx->res.inner + ": attachment vanished");
     return;
   }
-  if (!g_vol.ns->repoint_file(ctx->res.table, ctx->res.object, guid, hash, size, err))
+  if (!g_vol.ns->repoint_file(ctx->res.table, ctx->res.object, guid, hash, size, err,
+                              ctx->res.inner))
     error("save " + ctx->res.inner + ": " + err);
   else
     info("saved " + ctx->res.inner + " (" + std::to_string(size) + " bytes)");
@@ -1367,6 +1556,8 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
     return STATUS_OBJECT_PATH_NOT_FOUND;
   if (pr->object.key != ctx->res.object.key || pr->table != ctx->res.table)
     return STATUS_NOT_SAME_DEVICE;   // cross-record move: not in this version
+  if (!ctx->is_eph && !g_vol.ns->table_writable(ctx->res.table))
+    return STATUS_ACCESS_DENIED;
   std::string new_inner = pr->inner.empty() ? leaf : pr->inner + "/" + leaf;
 
   // Replacing an existing durable target: soft-delete it first so the name is
@@ -1522,8 +1713,27 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
   return fs;
 }
 
+// The notify pump runs for the life of a mount.
+static HANDLE g_pump_stop = nullptr;
+static std::thread g_pump;
+
+static void start_notify_pump(NamespaceService& ns) {
+  g_pump_stop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_pump = std::thread([&ns]() { ns.run_notify_pump(g_pump_stop); });
+}
+
+static void stop_notify_pump() {
+  if (g_pump_stop) ::SetEvent(g_pump_stop);
+  if (g_pump.joinable()) g_pump.join();
+  if (g_pump_stop) {
+    ::CloseHandle(g_pump_stop);
+    g_pump_stop = nullptr;
+  }
+}
+
 static void unmount_volume(FSP_FILE_SYSTEM* fs) {
   info("unmounting");
+  stop_notify_pump();
   FspFileSystemStopDispatcher(fs);
   FspFileSystemDelete(fs);
 }
@@ -1550,6 +1760,7 @@ int run_mount(const Options& o) {
     error(err);
     return 1;
   }
+  start_notify_pump(ns);
   g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
   ::WaitForSingleObject(g_stop_event, INFINITE);
@@ -1600,6 +1811,7 @@ int run_agent(const Options& base) {
       std::string err;
       FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
       if (!fs) throw std::runtime_error(err);
+      start_notify_pump(ns);
       backoff = 5;
 
       // Supervise: liveness probe every 30 s; token refresh daily.
