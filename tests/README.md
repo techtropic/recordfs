@@ -64,4 +64,28 @@ list_tables reports can_write=false for the read-only table, add_attachment
 on it is refused with a read-only reason, and the same operation on a
 writable table succeeds. Needs the restricted user (in the testing DB:
 rotest, read-only on quote) and its mount token in
-%TEMP%otest_tok.txt.
+%TEMP%
+otest_tok.txt.
+
+## eph_readonly_e2e.py
+
+The lock-file asymmetry on a table the user may read but not write: an
+ephemeral lock file is accepted and visible to other sessions, while a
+durable attachment write on the same record is refused. Run as a restricted
+user (rotest in the testing DB) with its mount token in %TEMP%otest_tok.txt.
+
+## multireader_e2e.py
+
+What a second reader sees when a peer saves the file it has open. Asserts
+that an already-open handle keeps reading the version it opened (content is
+immutable and hash-addressed, so the handle never follows the new blob), that
+the handle metadata likewise does not change, but that a fresh stat BY PATH
+picks up the new size once the file-tree TTL rolls and a fresh open reads the
+new bytes.
+
+NOTE on change notification: WinFsp raises watcher events for changes made
+through THIS machine driver, so a local edit is noticed normally. A PEER
+change raises none -- nothing tells this machine driver about it -- so an
+application that only listens will not learn of it, while one that re-stats
+the path will within the TTL. Surfacing peer changes needs
+FspFileSystemNotify, which is not implemented.
