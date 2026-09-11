@@ -373,4 +373,26 @@ bool WsClient::ephemeral_delete(const std::string& table, const std::string& key
       .value("success", false);
 }
 
+nlohmann::json WsClient::lease_acquire(const std::string& table, const std::string& key_type,
+                                       const nlohmann::json& key, const std::string& path,
+                                       const std::string& open_id, int access, int share,
+                                       const std::string& machine) {
+  auto d = eph_target(table, key_type, key, path);
+  d["open_id"] = open_id;
+  d["access"] = access;
+  d["share"] = share;
+  d["machine"] = machine;
+  return request("file_lease_acquire", std::move(d));
+}
+
+bool WsClient::lease_release(const std::string& open_id) {
+  nlohmann::json d;
+  d["open_id"] = open_id;
+  return request("file_lease_release", std::move(d)).value("success", false);
+}
+
+nlohmann::json WsClient::lease_renew() {
+  return request("file_lease_renew", nlohmann::json::object());
+}
+
 }  // namespace rfs

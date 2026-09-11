@@ -6,8 +6,8 @@ RecordFS presents the file attachments of a record-keeping server as a real
 drive letter — one folder per record, named so people can find things:
 
 ```
-S:\workorders\50049 - 250089 - Chris Wilson - Lot 22\plan.dwg
-S:\workorders\50049 - 250089 - Chris Wilson - Lot 22\photos\install-1.jpg
+S:\workorders\250089 - Chris Wilson - Lot 22\plan.dwg
+S:\workorders\250089 - Chris Wilson - Lot 22\photos\install-1.jpg
 ```
 
 Applications see an ordinary disk. CAD packages load and save drawings (with
@@ -16,8 +16,39 @@ lost on a desktop, and everything for a job lives with the job.
 
 ## Status
 
-Early development. Current milestone: read-only mount (browse + open).
-Write-back (save-in-place from applications) is designed and follows.
+Pre-1.0, in field testing. The drive browses, opens, and saves in place
+(write-back through content-addressed uploads), honours the server's table
+and per-file permissions, and behaves like a shared drive when several
+people work on the same records (below). The wire contract is
+[docs/protocol.md](docs/protocol.md).
+
+## Several people, one file
+
+RecordFS aims to behave like a file share:
+
+- **File in use.** While someone has a document open for editing, a second
+  person who opens it on another machine gets what a share would give them:
+  Office and AutoCAD report it locked for editing by that person and offer a
+  read-only copy (Office's *Notify* works — write access arrives when the
+  file is closed). Nobody can delete or rename a file someone else is
+  editing. The server arbitrates this with share-mode leases (protocol §4.5)
+  that end the moment the editor closes the file, or within 90 s if their
+  machine drops off the network.
+- **Lock files are shared.** Office `~$` owner files, AutoCAD `.dwl` and
+  LibreOffice `.~lock` files are visible on every machine, so applications'
+  own "who has this open" machinery works.
+- **Changes show up.** A save made elsewhere raises a change notification in
+  folders you have open within about 5 s, so applications that watch for it
+  offer to reload; a fresh open always reads the latest version.
+- **Open files stay stable.** A file you already have open keeps the version
+  you opened, as it would on a share when someone else replaces it.
+- **Conflict copies as the last resort.** If two saves still collide (say,
+  against a server too old to arbitrate), the later one is kept beside the
+  other as `name (conflict <date time>).ext` — nothing is overwritten.
+
+Not supported: databases that several people write at once (Access,
+QuickBooks company files). They rely on byte-range locking inside one shared
+file, which a whole-file model cannot provide.
 
 ## How it works
 
@@ -77,11 +108,12 @@ solution root; not committed).
 
 - **WinFsp** — installed by the setup bundle.
 - **Microsoft Visual C++ 2015–2022 x64 Redistributable** — `recordfs.exe` and
-  the bundled OpenSSL DLLs import `MSVCP140`/`VCRUNTIME140`. It is *not*
-  shipped here; deployments that run the record-keeping server's own desktop
-  client already have it. On a machine without it the agent cannot start (a
-  background process that fails to resolve imports does so silently — check
-  `recordfs probe` from a console, which reports the loader error).
+  the bundled OpenSSL DLLs import `MSVCP140`/`VCRUNTIME140`. The setup bundle
+  chains Microsoft's own `vc_redist.x64.exe` (never app-local copies, so
+  Windows Update keeps servicing the runtime). Installing the bare MSI skips
+  it: on a machine without the runtime the agent cannot start, and a
+  background process that fails to resolve imports does so silently — run
+  `recordfs probe` from a console, which reports the loader error.
 
 ## Usage
 

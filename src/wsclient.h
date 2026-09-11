@@ -71,6 +71,17 @@ public:
   bool ephemeral_delete(const std::string& table, const std::string& key_type,
                         const nlohmann::json& key, const std::string& path);
 
+  // File leases (protocol §4.5): cross-machine share modes. `access` and
+  // `share` use the FILE_SHARE_* bit layout (1 read, 2 write, 4 delete).
+  // Returns the response frame: {success, granted, holder?}. Throws like
+  // request() -- a 403 means the server predates leases.
+  nlohmann::json lease_acquire(const std::string& table, const std::string& key_type,
+                               const nlohmann::json& key, const std::string& path,
+                               const std::string& open_id, int access, int share,
+                               const std::string& machine);
+  bool lease_release(const std::string& open_id);
+  nlohmann::json lease_renew();
+
   const std::string& url() const { return url_; }
 
 private:

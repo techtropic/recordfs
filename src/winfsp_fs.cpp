@@ -6,9 +6,11 @@
 //   S:\<table>\<record display>\<attachment path...>
 //
 // Browse + open (hydrate-on-open, reads served from the local
-// content-addressed cache), plus the ephemeral plane's writable lock/temp
-// files. Durable attachments are read-only per file until the write-back
-// engine lands behind this same namespace service.
+// content-addressed cache), save through per-handle working copies
+// (write-back), the ephemeral plane's shared lock/temp files, and sharing
+// between machines: file leases turn a second editor's open into "file in
+// use" (protocol 4.5), and the notify pump surfaces a peer's save as a change
+// notification.
 //
 // Directory names are display strings, but IDENTITY IS ALWAYS THE RECORD KEY:
 // an open handle carries its record by key, and a path whose display has
@@ -83,6 +85,15 @@ uint64_t now_filetime() {
   return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
+// This machine's name -- what another user is told when a file they want is
+// open here.
+std::string computer_name() {
+  wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1];
+  DWORD n = MAX_COMPUTERNAME_LENGTH + 1;
+  if (!::GetComputerNameW(buf, &n)) return {};
+  return narrow(buf);
+}
+
 // "YYYY-MM-DD HH:MM:SS" (server-local) -> FILETIME as uint64; fallback ft0.
 uint64_t parse_timestamp(const std::string& s, uint64_t fallback) {
   SYSTEMTIME st{};
@@ -113,6 +124,9 @@ constexpr auto kTableListTtl = std::chrono::seconds(60);
 // staleness bound an application sees.
 constexpr auto kNotifyPollInterval = std::chrono::seconds(5);
 constexpr auto kActiveRecordLinger = std::chrono::minutes(2);
+// File leases (protocol 4.5) expire server-side unless renewed; the pump
+// renews them well inside that window.
+constexpr auto kLeaseRenewInterval = std::chrono::seconds(30);
 // A blob the daemon does not have will not appear on its own; a daemon that
 // was briefly unreachable will. Remember the former far longer.
 constexpr auto kMissingBlobTtl = std::chrono::minutes(10);
@@ -135,7 +149,7 @@ void notify_change(const std::string& table, const std::string& dir_name,
 class NamespaceService {
 public:
   NamespaceService(WsClient& ws, FileCache& cache)
-      : ws_(ws), cache_(cache), mount_time_(now_filetime()) {}
+      : ws_(ws), cache_(cache), mount_time_(now_filetime()), machine_(computer_name()) {}
 
   uint64_t mount_time() const { return mount_time_; }
 
@@ -355,12 +369,18 @@ public:
 
   // Poll every active record and turn peer-side changes into notifications.
   // Runs on its own thread: an application holding a drawing open may never
-  // touch the directory again, so nothing else would drive a refresh.
+  // touch the directory again, so nothing else would drive a refresh. The
+  // same heartbeat keeps this mount's file leases alive.
   void run_notify_pump(HANDLE stop) {
+    auto last_renew = std::chrono::steady_clock::now();
     for (;;) {
       if (::WaitForSingleObject(stop, (DWORD)std::chrono::duration_cast<std::chrono::milliseconds>(
                                           kNotifyPollInterval).count()) == WAIT_OBJECT_0)
         return;
+      if (std::chrono::steady_clock::now() - last_renew >= kLeaseRenewInterval) {
+        renew_leases();
+        last_renew = std::chrono::steady_clock::now();
+      }
       std::vector<ActiveRecord> due;
       {
         std::lock_guard lock(active_mutex_);
@@ -407,6 +427,92 @@ public:
   void invalidate_tree(const std::string& table, const ObjectEntry& o) {
     std::lock_guard lock(mutex_);
     trees_.erase(lower_ascii(table) + "\x1f" + o.key);
+  }
+
+  // --- file leases: cross-machine share modes (protocol 4.5) ----------------
+
+  enum class Lease { Granted, InUse, Unavailable };
+  struct LeaseHolder {
+    std::string user, machine, since;
+  };
+
+  // Register an open with the server. InUse = another machine holds the file
+  // in a way this open collides with. Unavailable = the server cannot
+  // arbitrate (too old, or unreachable): callers proceed, and the conflict
+  // copy at save time stays the backstop. Re-acquiring an id that is already
+  // held moves it to `inner` (a rename).
+  Lease acquire_lease(const std::string& table, const ObjectEntry& o, const std::string& inner,
+                      uint64_t open_id, int access, int share, LeaseHolder* who) {
+    if (!leases_supported_) return Lease::Unavailable;
+    nlohmann::json r;
+    try {
+      r = ws_.lease_acquire(table, o.numeric ? "id" : "guid",
+                            o.numeric ? nlohmann::json(o.id) : nlohmann::json(o.key),
+                            "/" + inner, std::to_string(open_id), access, share, machine_);
+    } catch (const std::exception& e) {
+      std::string what = e.what();
+      if (what.find("not permitted") != std::string::npos) {
+        leases_supported_ = false;
+        warn("server does not arbitrate file sharing (it predates file leases) -- "
+             "file-in-use signaling is off; concurrent saves fall back to conflict copies");
+      } else {
+        warn("lease " + inner + ": " + what);
+      }
+      return Lease::Unavailable;
+    }
+    if (!r.value("success", false)) {
+      warn("lease " + inner + ": " + r.value("error", "refused"));
+      return Lease::Unavailable;
+    }
+    if (r.value("granted", false)) {
+      std::lock_guard lock(leases_mutex_);
+      held_.insert(open_id);
+      return Lease::Granted;
+    }
+    if (who && r.contains("holder") && r["holder"].is_object()) {
+      who->user = r["holder"].value("user", "");
+      who->machine = r["holder"].value("machine", "");
+      who->since = r["holder"].value("since", "");
+    }
+    return Lease::InUse;
+  }
+
+  void release_lease(uint64_t open_id) {
+    {
+      std::lock_guard lock(leases_mutex_);
+      if (!held_.erase(open_id)) return;
+    }
+    try {
+      ws_.lease_release(std::to_string(open_id));
+    } catch (const std::exception&) {
+      // The session is gone -- and the server released everything it held.
+    }
+  }
+
+  void renew_leases() {
+    {
+      std::lock_guard lock(leases_mutex_);
+      if (held_.empty()) return;
+    }
+    try {
+      ws_.lease_renew();
+    } catch (const std::exception&) {
+      // A blip; the next heartbeat retries well inside the server's TTL.
+    }
+  }
+
+  // A file's CURRENT entry, refetching the record's listing first (the cached
+  // tree can trail a peer's save by its TTL). nullopt = gone. Throws on
+  // transport failure.
+  std::optional<FileEntry> refreshed_entry(const std::string& table, const ObjectEntry& o,
+                                           const std::string& inner) {
+    auto tree = files_locked(table, o, true);
+    auto child = tree ? tree->find(inner) : std::nullopt;
+    if (!child || child->is_dir || !child->file) return std::nullopt;
+    return *child->file;
+  }
+  void refresh_files(const std::string& table, const ObjectEntry& o) {
+    files_locked(table, o, true);
   }
 
   // --- write-back plane -----------------------------------------------------
@@ -663,6 +769,7 @@ private:
   WsClient& ws_;
   FileCache& cache_;
   uint64_t mount_time_;
+  std::string machine_;
   std::mutex tables_mutex_;
   std::vector<std::string> tables_;
   std::map<std::string, bool> writable_;   // lower(table) -> table write mask
@@ -697,6 +804,11 @@ private:
   // (table, key, inner) -> content this machine just wrote.
   std::mutex local_writes_mutex_;
   std::map<std::string, std::string> local_writes_;
+
+  // Open ids this mount holds leases for (renewed by the pump).
+  std::mutex leases_mutex_;
+  std::set<uint64_t> held_;
+  std::atomic<bool> leases_supported_{true};
 };
 
 // ---------------------------------------------------------------------------
@@ -794,6 +906,19 @@ struct FsContext {  // per-open-handle
   std::string base_hash;                 // content id this copy started from
   std::string guid;                      // attachment row (empty when is_new)
   std::string mimetype;
+
+  // Cross-machine share lease for this handle (protocol 4.5); 0 = none.
+  uint64_t lease = 0;
+  int lease_access = 0;
+  int lease_share = 0;
+
+  FsContext() = default;
+  FsContext(const FsContext&) = delete;
+  FsContext& operator=(const FsContext&) = delete;
+  // Releases a lease still held: an open that failed after claiming one, or
+  // one the kernel's own share check refused after Open succeeded (the driver
+  // then sends Close without Cleanup).
+  ~FsContext();
 };
 
 // Per-open working copy under %LOCALAPPDATA%\RecordFS\work.
@@ -876,9 +1001,22 @@ void discard_work(FsContext* ctx) {
 bool is_ephemeral_name(const std::string& leaf) {
   std::string l = lower_ascii(leaf);
   if (l.rfind("~$", 0) == 0) return true;
+  if (l.rfind(".~lock.", 0) == 0 && l.ends_with("#")) return true;   // LibreOffice
   for (const char* suf : {".tmp", ".dwl", ".dwl2", ".laccdb", ".ldb"})
     if (l.size() > strlen(suf) && l.ends_with(suf)) return true;
   return false;
+}
+
+// Owner files: how applications tell a would-be editor WHO has a document
+// open (Office's ~$ file, AutoCAD's .dwl/.dwl2, LibreOffice's .~lock.#).
+// Their holders may keep them open for the whole editing session, so these
+// are published as they change rather than only at close -- otherwise a peer
+// that is refused the document reads an empty owner file.
+bool is_owner_file(const std::string& leaf) {
+  std::string l = lower_ascii(leaf);
+  if (l.rfind("~$", 0) == 0) return true;
+  if (l.rfind(".~lock.", 0) == 0 && l.ends_with("#")) return true;
+  return l.ends_with(".dwl") || l.ends_with(".dwl2");
 }
 
 struct Volume {
@@ -889,6 +1027,10 @@ struct Volume {
   ULONG sd_size = 0;
 };
 Volume g_vol;
+
+FsContext::~FsContext() {
+  if (lease && g_vol.ns) g_vol.ns->release_lease(lease);
+}
 
 // Report a change under <table>\<record>\<inner> to anyone watching that
 // directory. WinFsp requires the Begin/Notify/End bracket, and Begin can
@@ -926,6 +1068,96 @@ void notify_change(const std::string& table, const std::string& dir_name,
   const char* what = action == FILE_ACTION_ADDED ? "added"
                    : action == FILE_ACTION_REMOVED ? "removed" : "modified";
   info(std::string("peer change (") + what + "): " + rel);
+}
+
+// ---------------------------------------------------------------------------
+// cross-machine sharing ("file in use")
+
+// Lease bits use the FILE_SHARE_* layout (protocol 4.5).
+constexpr int kLeaseRead = 1;
+constexpr int kLeaseWrite = 2;
+constexpr int kLeaseDelete = 4;
+
+int lease_access(UINT32 granted) {
+  int a = 0;
+  if (granted & (FILE_READ_DATA | FILE_EXECUTE)) a |= kLeaseRead;
+  if (granted & (FILE_WRITE_DATA | FILE_APPEND_DATA)) a |= kLeaseWrite;
+  if (granted & DELETE) a |= kLeaseDelete;
+  return a;
+}
+
+// The share mode the application passed to CreateFile. WinFsp hands the
+// callbacks only the granted access; the share mode is on the raw request.
+int request_share() {
+  auto* oc = FspFileSystemGetOperationContext();
+  if (!oc || !oc->Request || oc->Request->Kind != FspFsctlTransactCreateKind)
+    return kLeaseRead | kLeaseWrite | kLeaseDelete;
+  return (int)(oc->Request->Req.Create.ShareAccess & 7);
+}
+
+std::atomic<uint64_t> g_next_open_id{1};
+
+// kernel32 retries a refused delete or move, and Explorer probes a file it is
+// refused repeatedly: report each refusal once per few seconds, not per try.
+bool first_report(const std::string& what) {
+  static std::mutex m;
+  static std::map<std::string, std::chrono::steady_clock::time_point> seen;
+  std::lock_guard lock(m);
+  auto now = std::chrono::steady_clock::now();
+  if (seen.size() > 256) seen.clear();
+  auto it = seen.find(what);
+  if (it != seen.end() && now - it->second < std::chrono::seconds(10)) return false;
+  seen[what] = now;
+  return true;
+}
+
+// Claim a cross-machine lease for an open that can change or remove a file.
+// Opens made through THIS drive are arbitrated by this machine's kernel; the
+// server arbitrates between machines, under the same Windows sharing rules.
+// A collision is the "file in use" an editor gets on a real share --
+// STATUS_SHARING_VIOLATION, which Office and CAD turn into "locked for
+// editing by <user>" by reading the holder's owner file (the refresh below
+// makes it visible here right away). Readers are never registered: each
+// holds an immutable snapshot, so no save elsewhere can disturb them.
+NTSTATUS claim_lease(FsContext* ctx, UINT32 granted_access) {
+  int access = lease_access(granted_access);
+  if (!(access & (kLeaseWrite | kLeaseDelete))) return STATUS_SUCCESS;
+  int share = request_share();
+  uint64_t id = g_next_open_id.fetch_add(1);
+  NamespaceService::LeaseHolder who;
+  switch (g_vol.ns->acquire_lease(ctx->res.table, ctx->res.object, ctx->res.inner, id, access,
+                                  share, &who)) {
+    case NamespaceService::Lease::Granted:
+      ctx->lease = id;
+      ctx->lease_access = access;
+      ctx->lease_share = share;
+      return STATUS_SUCCESS;
+    case NamespaceService::Lease::Unavailable:
+      return STATUS_SUCCESS;   // cannot arbitrate; the save-time conflict copy guards
+    case NamespaceService::Lease::InUse:
+      break;
+  }
+  std::string path = ctx->res.object.dir_name + "/" + ctx->res.inner;
+  if (first_report(path + "\x1f" + who.machine + "\x1f" + who.user))
+    info("in use: " + path + " is open on " +
+         (who.machine.empty() ? std::string("another machine") : who.machine) +
+         (who.user.empty() ? std::string() : " by " + who.user) +
+         (who.since.empty() ? std::string() : " since " + who.since) + " -- sharing violation");
+  try {
+    g_vol.ns->refresh_files(ctx->res.table, ctx->res.object);
+  } catch (const std::exception&) {
+  }
+  return STATUS_SHARING_VIOLATION;
+}
+
+// Publish an owner file's bytes as they change (see is_owner_file).
+void eph_write_through(FsContext* ctx) {
+  auto slash = ctx->res.inner.find_last_of('/');
+  std::string leaf = slash == std::string::npos ? ctx->res.inner : ctx->res.inner.substr(slash + 1);
+  if (!is_owner_file(leaf) || ctx->eph_buf.size() > 64 * 1024) return;
+  std::string err;
+  if (g_vol.ns->eph_put(ctx->res.table, ctx->res.object, ctx->res.inner, ctx->eph_buf, err))
+    ctx->dirty = false;   // published; cleanup has nothing left to send
 }
 
 void fill_file_info(const Resolved& r, FSP_FSCTL_FILE_INFO* info) {
@@ -1021,9 +1253,9 @@ constexpr size_t kEphMaxBytes = 1 << 20;  // matches the server-side cap
 // call CreateDirectory then immediately create inside it).
 // The Create/Open/Overwrite trio must all exist or the WinFsp Create
 // dispatcher refuses every open with IoStatus=c0000010.
-NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UINT32,
-                   UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* file_context,
-                   FSP_FSCTL_FILE_INFO* info) {
+NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options,
+                   UINT32 granted_access, UINT32, PSECURITY_DESCRIPTOR, UINT64,
+                   PVOID* file_context, FSP_FSCTL_FILE_INFO* info) {
   std::string full = narrow(file_name);
   auto parts = split_backslash(full);
   if (parts.size() < 3) return STATUS_MEDIA_WRITE_PROTECTED;  // root / table level
@@ -1075,6 +1307,10 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options, UIN
     *file_context = ctx.release();
     return STATUS_SUCCESS;
   }
+
+  // Another machine may already hold this name -- it created or opened it
+  // since our listing was taken. Arbitrate before anything is registered.
+  if (NTSTATUS st = claim_lease(ctx.get(), granted_access); !NT_SUCCESS(st)) return st;
 
   if (is_ephemeral_name(leaf)) {
     ctx->is_eph = true;
@@ -1170,6 +1406,7 @@ NTSTATUS SvcWrite(FSP_FILE_SYSTEM*, PVOID file_context, PVOID buffer, UINT64 off
   if (off + len > ctx->eph_buf.size()) ctx->eph_buf.resize(off + len, '\0');
   std::memcpy(ctx->eph_buf.data() + off, buffer, len);
   ctx->dirty = true;
+  eph_write_through(ctx);
   *bytes_transferred = (ULONG)len;
   fill_eph_info(ctx, info);
   return STATUS_SUCCESS;
@@ -1195,6 +1432,7 @@ NTSTATUS SvcSetFileSize(FSP_FILE_SYSTEM*, PVOID file_context, UINT64 new_size,
     if (new_size > kEphMaxBytes) return STATUS_DISK_FULL;
     ctx->eph_buf.resize((size_t)new_size, '\0');
     ctx->dirty = true;
+    eph_write_through(ctx);
   }
   fill_eph_info(ctx, info);
   return STATUS_SUCCESS;
@@ -1308,6 +1546,19 @@ VOID SvcCleanup(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, ULONG flags) {
   auto* ctx = (FsContext*)file_context;
   if (!ctx) return;
 
+  // The handle is closing, so the file is free for the next editor on another
+  // machine -- but only AFTER the save below has landed, so whoever opens it
+  // next starts from this user's content, not the version before it.
+  struct ReleaseLeaseAfter {
+    FsContext* c;
+    ~ReleaseLeaseAfter() {
+      if (c->lease) {
+        g_vol.ns->release_lease(c->lease);
+        c->lease = 0;
+      }
+    }
+  } release_after{ctx};
+
   if (flags & FspCleanupDelete) {
     if (ctx->deleted) return;
     ctx->deleted = true;
@@ -1360,6 +1611,32 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
   auto ctx = std::make_unique<FsContext>();
   ctx->res = *r;
 
+  const bool wants_write =
+      (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0;
+  if (r->kind == Resolved::File) {
+    if (!r->file->ephemeral && wants_write && !r->file->can_write) return STATUS_ACCESS_DENIED;
+    ctx->res.inner = r->file->path;
+
+    // Cross-machine sharing, before a single byte moves.
+    if (NTSTATUS st = claim_lease(ctx.get(), granted_access); !NT_SUCCESS(st)) return st;
+
+    // A writer starts from the CURRENT content. The cached listing can trail a
+    // peer's save by the tree TTL, and copying up that stale version would
+    // turn this user's save into a conflict copy -- the classic "someone else
+    // just closed it, now I edit" sequence. With the lease held, no other
+    // mount is mid-edit on it, so this read is the one that counts.
+    if (ctx->lease && (ctx->lease_access & kLeaseWrite) && !r->file->ephemeral) {
+      try {
+        auto fresh = g_vol.ns->refreshed_entry(r->table, r->object, r->file->path);
+        if (!fresh) return STATUS_OBJECT_NAME_NOT_FOUND;   // a peer removed it
+        r->file = *fresh;
+        ctx->res.file = *fresh;
+      } catch (const std::exception&) {
+        // Keep the cached entry; the save-time conflict check still guards it.
+      }
+    }
+  }
+
   if (r->kind == Resolved::File && r->file->ephemeral) {
     ctx->is_eph = true;
     auto bytes = g_vol.ns->eph_get(r->table, r->object, r->file->path);
@@ -1372,10 +1649,6 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
   }
 
   if (r->kind == Resolved::File) {
-    const bool wants_write =
-        (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0;
-    if (wants_write && !r->file->can_write) return STATUS_ACCESS_DENIED;
-
     auto h = g_vol.ns->hydrate(*r->file);
     if (!h.path) {
       // Report what is actually wrong. STATUS_IO_DEVICE_ERROR reads to users
@@ -1560,11 +1833,35 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
     return STATUS_ACCESS_DENIED;
   std::string new_inner = pr->inner.empty() ? leaf : pr->inner + "/" + leaf;
 
+  // Carry this handle's lease to the new name FIRST: if another machine has
+  // the target open, the rename fails the way it would on a share, before
+  // the existing target is deleted or anything else has changed.
+  const std::string old_inner = ctx->res.inner;
+  bool lease_moved = false;
+  if (ctx->lease) {
+    NamespaceService::LeaseHolder who;
+    auto l = g_vol.ns->acquire_lease(ctx->res.table, ctx->res.object, new_inner, ctx->lease,
+                                     ctx->lease_access, ctx->lease_share, &who);
+    if (l == NamespaceService::Lease::InUse) {
+      info("rename refused: " + new_inner + " is open on " + who.machine + " by " + who.user);
+      return STATUS_ACCESS_DENIED;
+    }
+    lease_moved = l == NamespaceService::Lease::Granted;
+  }
+  auto undo_lease = [&]() {
+    if (lease_moved)
+      g_vol.ns->acquire_lease(ctx->res.table, ctx->res.object, old_inner, ctx->lease,
+                              ctx->lease_access, ctx->lease_share, nullptr);
+  };
+
   // Replacing an existing durable target: soft-delete it first so the name is
   // free (the server keeps it recoverable within retention).
   auto existing = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, new_inner);
   if (existing && !existing->guid.empty()) {
-    if (!replace_if_exists) return STATUS_OBJECT_NAME_COLLISION;
+    if (!replace_if_exists) {
+      undo_lease();
+      return STATUS_OBJECT_NAME_COLLISION;
+    }
     std::string derr;
     g_vol.ns->delete_file(ctx->res.table, ctx->res.object, existing->guid, derr);
   }
@@ -1572,8 +1869,10 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
   std::string err;
   if (ctx->is_eph) {
     if (is_ephemeral_name(leaf)) {   // temp -> temp: stays on the ephemeral plane
-      if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, new_inner, ctx->eph_buf, err))
+      if (!g_vol.ns->eph_put(ctx->res.table, ctx->res.object, new_inner, ctx->eph_buf, err)) {
+        undo_lease();
         return STATUS_IO_DEVICE_ERROR;
+      }
       g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner);
       ctx->res.inner = new_inner;
       ctx->dirty = false;
@@ -1588,7 +1887,11 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
               g_vol.ns->add_file(ctx->res.table, ctx->res.object, new_inner, hash,
                                  guess_mimetype(leaf), size, err);
     std::error_code ec; std::filesystem::remove(tmp, ec);
-    if (!ok) { error("promote " + new_inner + ": " + err); return STATUS_IO_DEVICE_ERROR; }
+    if (!ok) {
+      error("promote " + new_inner + ": " + err);
+      undo_lease();
+      return STATUS_IO_DEVICE_ERROR;
+    }
     g_vol.ns->eph_del(ctx->res.table, ctx->res.object, ctx->res.inner);
     ctx->is_eph = false;
     ctx->dirty = false;
@@ -1612,9 +1915,13 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
     auto live = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, ctx->res.inner);
     if (live) guid = live->guid;
   }
-  if (guid.empty()) return STATUS_OBJECT_NAME_NOT_FOUND;
+  if (guid.empty()) {
+    undo_lease();
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+  }
   if (!g_vol.ns->rename_file(ctx->res.table, ctx->res.object, guid, new_inner, err)) {
     error("rename " + ctx->res.inner + " -> " + new_inner + ": " + err);
+    undo_lease();
     return STATUS_ACCESS_DENIED;
   }
   ctx->res.inner = new_inner;
@@ -1656,10 +1963,12 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
   params.CasePreservedNames = 1;
   params.UnicodeOnDisk = 1;
   params.PersistentAcls = 0;
-  // Not ReadOnlyVolume: the ephemeral plane (lock/temp files) is writable.
-  // Durable attachments stay read-only per file (attribute + open denial)
-  // until the P2 write-back engine.
-  params.PostCleanupWhenModifiedOnly = 1;
+  // Not ReadOnlyVolume: writes land through write-back and the ephemeral
+  // plane; read-only is per file (the server's masks) and per table.
+  // Cleanup on EVERY handle close, not only modified ones: an editor that
+  // opens a drawing and closes it unchanged must free it for other machines
+  // at that moment (the final Close IRP can trail it indefinitely).
+  params.PostCleanupWhenModifiedOnly = 0;
   params.UmFileContextIsUserContext2 = 1;
   wcscpy_s(params.FileSystemName, L"RecordFS");  // filesystem TYPE, not the label
 

@@ -64,16 +64,14 @@ list_tables reports can_write=false for the read-only table, add_attachment
 on it is refused with a read-only reason, and the same operation on a
 writable table succeeds. Needs the restricted user (in the testing DB:
 rotest, read-only on quote) and its mount token in
-%TEMP%
-otest_tok.txt.
+`%TEMP%\rotest_tok.txt`.
 
 ## eph_readonly_e2e.py
 
 The lock-file asymmetry on a table the user may read but not write: an
 ephemeral lock file is accepted and visible to other sessions, while a
 durable attachment write on the same record is refused. Run as a restricted
-user (rotest in the testing DB) with its mount token in %TEMP%
-otest_tok.txt.
+user (rotest in the testing DB) with its mount token in `%TEMP%\rotest_tok.txt`.
 
 ## multireader_e2e.py
 
@@ -101,3 +99,50 @@ reads the new bytes. Run it with the mount up.
 Two attachments with byte-identical content share one blob. Editing one must
 produce a new hash and re-point only that row, leaving the other file exactly
 as it was -- the property that lets deduplication stay invisible to users.
+
+## lease_protocol_e2e.py
+
+The file-lease protocol (docs/protocol.md 4.5) at the WebSocket level, no
+mount involved: two file sessions play two machines and exercise the
+server's share-mode arbitration directly -- the Windows sharing matrix, the
+holder named in a refusal, moves (a rename carrying its lease, and a move
+onto a held name refused), renew, release, case-insensitive names, the
+same-session exemption, and release when a session dies. Also asserts that
+`list_tables` keeps its two meanings apart (mount root on a file session,
+admin introspection on a full session). Mints its own short-lived mount
+token; needs no file service.
+
+## file_in_use_e2e.py
+
+"File in use" through real mounts. Two mounts of one server (separate
+processes and sessions, so the kernel cannot arbitrate between them -- only
+the server can) stand in for two machines, and every handle is opened with
+explicit Win32 access/share modes the way Office and CAD open documents:
+an editor refuses a second editor (`ERROR_SHARING_VIOLATION`) but not a
+read-only open; nobody can delete or rename a file someone is editing;
+closing frees it immediately; mutually-sharing writers coexist; a
+deny-write reader does not block a remote editor (the deliberate SMB
+difference); the holder's owner file is readable by the refused machine at
+once, with its bytes, and cannot be deleted or overwritten while held; a
+rename onto a name another machine holds is refused; a lease follows a
+rename made through an open handle. `--crash <pid>` finally kills mount A
+while it holds a file and asserts mount B can edit it at once.
+
+Setup (no file service needed -- nothing uploads, which keeps a dev server
+on a shared database from owning a blob store): two stored profiles for the
+same server, mounted with `recordfs agent-run --profile leaseA` (S:) and
+`--profile leaseB` (T:); record 50049 holding `workorder-signed.pdf` with
+content both mounts can hydrate. Running each mount with its own
+`LOCALAPPDATA` gives each a separate log, cache and working area, like two
+machines.
+
+## excel_in_use_e2e.ps1
+
+The same property with the real application: invisible Excel instances on
+mount A and mount B. A opens the workbook read-write; B must get it
+READ-ONLY, see who holds it (from Excel's own owner file, over the
+ephemeral plane), and get write access once A closes (`ChangeFileAccess`,
+the "Notify" path). Only Excel processes the script started are ever
+stopped. Measured: B's Excel is refused the owner file (`~$<name>`) first
+and falls back to read-only from that -- the lock-file lease is load-bearing,
+not just the document's.

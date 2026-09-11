@@ -1,6 +1,7 @@
 # The File-Session Protocol
 
-**Version 1.1 — 2026-07-26** (adds the ephemeral plane, §4.4).
+**Version 1.2 — 2026-09-11** (adds table discovery, §4.0, and file leases —
+cross-machine "file in use" — §4.5; 1.1 added the ephemeral plane, §4.4).
 License: **CC-BY-4.0** — copy, implement, and adapt freely with attribution.
 This document specifies everything a file-mounting client (such as RecordFS)
 needs to interoperate with a compliant server. The reference server
@@ -68,6 +69,7 @@ error frame):
 
 | Request | Purpose | Phase |
 | --- | --- | --- |
+| `list_tables` | the mount root: tables holding attachments this user may read (§4.0) | read |
 | `list_objects` | enumerate a table's records (id + display) | read |
 | `get_object_display` | one record's display string | read |
 | `list_files` | one record's attachment listing | read |
@@ -76,6 +78,7 @@ error frame):
 | `refresh_client_token` | slide the mount token's expiry | session |
 | `get_current_stamp` | server change stamp (cheap liveness/staleness probe) | session |
 | `ephemeral_put` / `ephemeral_get` / `ephemeral_delete` | server-memory lock/temp files (§4.4) | read/write |
+| `file_lease_acquire` / `file_lease_release` / `file_lease_renew` | cross-machine share modes — "file in use" (§4.5) | session |
 | `add_attachment` | create an attachment row | write |
 | `rename_attachment` | rename/move within a record | write |
 | `link_attachment` | link an existing attachment to a record | write |
@@ -87,6 +90,30 @@ shapes will be specified in a v2 revision of this document before RecordFS's
 write-back phase. A read-only client needs only the read + session rows.
 
 ## 4. Namespace requests
+
+### 4.0 `list_tables` — the mount root
+
+```json
+{ "type": "request", "request": "list_tables", "id": 2, "data": {} }
+```
+
+Response — every table that holds at least one attachment and that the
+session user may read:
+
+```json
+{ "id": 2, "tables": [ { "table": "workorders", "key_type": "id", "can_write": true }, … ] }
+```
+
+- Discovered, not configured: a table appears once its first attachment
+  exists. Servers may cache the set for a few minutes.
+- `key_type` (`"id"` or `"guid"`) is how that table's records are addressed
+  in §4.2–§4.5.
+- `can_write` is the user's table-level write permission. Present `false`
+  as a read-only table and refuse writes up front (the server enforces it
+  regardless); absent means an older server — assume writable and let the
+  server refuse.
+- Only on a **file** session. On a full session the same request name is an
+  unrelated administrative verb.
 
 ### 4.1 `list_objects` — enumerate a table
 
@@ -183,7 +210,66 @@ with no durable rows and no blob storage. Properties:
   locks self-clean. Clients MUST treat a missing entry as normal
   (`success:false`, `"not found"`).
 - Mounting clients gate which names ride this plane by pattern (`~$*`,
-  `*.tmp`, `*.dwl`/`.dwl2`, `*.laccdb`/`.ldb`); everything else is durable.
+  `*.tmp`, `*.dwl`/`.dwl2`, `*.laccdb`/`.ldb`, LibreOffice's
+  `.~lock.*#`); everything else is durable.
+
+### 4.5 File leases — cross-machine share modes ("file in use")
+
+On a real share, a second user who opens a document someone else is editing
+gets a *sharing violation*; Office and CAD turn that into "locked for
+editing by <user>" and offer a read-only copy. Each client's operating
+system arbitrates only its own opens, so the server arbitrates **between
+clients** with leases:
+
+- `file_lease_acquire {…target…, path, open_id, access, share, machine}` →
+  `{success, granted, holder?}`.
+  - `access` and `share` are bitmasks in the Win32 `FILE_SHARE_*` layout:
+    `1` read, `2` write, `4` delete. `access` is what this open may do;
+    `share` is what it allows *other* opens to do.
+  - `open_id` is the client's name for this open (unique within the
+    session, ≤ 64 chars); `machine` is a display name shown to users who are
+    refused (≤ 64 chars).
+  - Refused when the open collides with one held by **another session**,
+    under the Windows rule: each side's access must be permitted by the
+    other side's share mode. Opens within one session never collide — the
+    client's own OS arbitrates those.
+  - `granted: false` carries `holder: {user, machine, since}` — who holds
+    the colliding open.
+  - Re-acquiring an `open_id` that is already held **moves** it to the new
+    path (a rename carries its lease) — atomically, and only if nobody else
+    holds the target; a refused move leaves the lease where it was.
+  - `path` is addressed as in §4.4 and compares case-insensitively (ASCII).
+  - `success: false` with `"unknown object"`, `"permission denied"` (table
+    read is required — a lease changes no data; the writes that follow carry
+    their own checks), `"bad request"`, or `"too many open files"`.
+- `file_lease_release {open_id}` → `{success}` (`false`, `"not held"`, for
+  an unknown id).
+- `file_lease_renew {}` → `{success, held}` — extends every lease the
+  session holds.
+- Lifetime: leases die with their session, and expire **90 s** after their
+  last renew — renew about every 30 s while holding any. A client that loses
+  its network without closing its socket frees its files within that
+  window. Leases live in server memory; a restart ends every file session,
+  and with it every open handle.
+
+Client conduct:
+
+- Register every open that can change or remove a file (write or delete
+  access). Release at the application's close — **after** any save it
+  triggers has landed, so the next editor starts from that content. Map
+  `granted: false` to a sharing violation.
+- Readers need not register. Clients read immutable, content-addressed
+  snapshots, so a save elsewhere cannot disturb an open reader — which is
+  why a reader that denies write sharing does **not** block a remote editor
+  here, deliberately unlike SMB (where it blocks every save).
+- After acquiring a write lease, re-read the record's listing before copying
+  content up: a cached listing may predate the previous editor's save.
+- Owner and lock files (§4.4) are leased like any other file, so a peer
+  cannot delete or overwrite a live one. Publish their bytes as they change
+  rather than at close: applications read them to tell the refused user who
+  holds the document.
+- A server that predates leases answers with the §1 403 frame: carry on
+  without arbitration (conflict detection at save time remains the backstop).
 
 ## 5. Mount-token management
 
