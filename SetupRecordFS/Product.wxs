@@ -4,7 +4,8 @@
      is NOT installed by this MSI — the bundle (SetupRecordFSBundle) chains
      the official signed WinFsp installer first; this package only refuses to
      install where WinFsp is absent (belt for MSI-only installs). -->
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 
   <?define BinDirV = "$(var.BinDir)" ?>
 
@@ -20,13 +21,22 @@
              InstallScope="perMachine"
              Platform="x64"
              Description="RecordFS — mount business records as a native Windows drive"
-             Comments="RecordFS (MIT) — https://github.com/marcmicalizzi/recordfs"
+             Comments="RecordFS (MIT) — https://github.com/techtropic/recordfs"
              Manufacturer="Techtropic Inc."/>
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- Upgrades install the new version over the old one first and remove the
+         old product afterwards. With the default early removal, every upgrade
+         would delete the RecordFSUpdate service and create it again, and any
+         open handle to it at that instant (services.msc, a monitoring agent)
+         leaves it "marked for deletion" until a reboot; an unattended
+         update that bricks its own updater. Requires versioned binaries
+         (recordfs.exe carries a version resource) and path-stable component
+         GUIDs. -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/marcmicalizzi/recordfs" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/techtropic/recordfs" />
     <Property Id="ARPCONTACT" Value="Marc Micalizzi" />
     <Property Id="ARPCOMMENTS" Value="RecordFS — records as a native drive (MIT)" />
 
@@ -51,8 +61,40 @@
          the agent command line, still wins over the machine default. Secure="yes" lets the values survive
          an elevated (UAC) install, where the UI and execute sequences run in
          different processes. -->
-    <Property Id="DRIVELETTER" Value="S:" Secure="yes" />
-    <Property Id="VOLUMELABEL" Value="Records" Secure="yes" />
+    <!-- Settings survive upgrades. An unattended update runs with no command
+         line at all, so a plain default here would silently put every site's
+         custom drive letter back to S:. Precedence: the command line, then
+         what this machine already has, then the default. -->
+    <Property Id="DRIVELETTER" Secure="yes" />
+    <Property Id="VOLUMELABEL" Secure="yes" />
+    <!-- AUTOUPDATE=0 turns automatic updates off (sites that deploy through
+         their own tooling); the updater service stays installed but idle. -->
+    <Property Id="AUTOUPDATE" Secure="yes" />
+    <Property Id="SAVED_DRIVELETTER" Secure="yes">
+      <RegistrySearch Id="SavedDriveLetter" Root="HKLM" Key="SOFTWARE\RecordFS"
+                      Name="DriveLetter" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_VOLUMELABEL" Secure="yes">
+      <RegistrySearch Id="SavedVolumeLabel" Root="HKLM" Key="SOFTWARE\RecordFS"
+                      Name="VolumeLabel" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_AUTOUPDATE" Secure="yes">
+      <RegistrySearch Id="SavedAutoUpdate" Root="HKLM" Key="SOFTWARE\RecordFS"
+                      Name="AutoUpdate" Type="raw" Win64="yes" />
+    </Property>
+    <SetProperty Action="RestoreDriveLetter" Id="DRIVELETTER" Value="[SAVED_DRIVELETTER]"
+                 After="AppSearch" Sequence="both">SAVED_DRIVELETTER AND NOT DRIVELETTER</SetProperty>
+    <SetProperty Action="DefaultDriveLetter" Id="DRIVELETTER" Value="S:"
+                 After="RestoreDriveLetter" Sequence="both">NOT DRIVELETTER</SetProperty>
+    <SetProperty Action="RestoreVolumeLabel" Id="VOLUMELABEL" Value="[SAVED_VOLUMELABEL]"
+                 After="DefaultDriveLetter" Sequence="both">SAVED_VOLUMELABEL AND NOT VOLUMELABEL</SetProperty>
+    <SetProperty Action="DefaultVolumeLabel" Id="VOLUMELABEL" Value="Records"
+                 After="RestoreVolumeLabel" Sequence="both">NOT VOLUMELABEL</SetProperty>
+    <!-- A DWORD reads back as "#0" / "#1". -->
+    <SetProperty Action="RestoreAutoUpdateOff" Id="AUTOUPDATE" Value="0"
+                 After="DefaultVolumeLabel" Sequence="both"><![CDATA[SAVED_AUTOUPDATE = "#0" AND NOT AUTOUPDATE]]></SetProperty>
+    <SetProperty Action="DefaultAutoUpdate" Id="AUTOUPDATE" Value="1"
+                 After="RestoreAutoUpdateOff" Sequence="both">NOT AUTOUPDATE</SetProperty>
 
     <WixVariable Id="WixUILicenseRtf" Value="..\lic.rtf" />
 
@@ -61,6 +103,7 @@
       <ComponentGroupRef Id="PathEntry" />
       <ComponentGroupRef Id="Autostart" />
       <ComponentGroupRef Id="DriveSettings" />
+      <ComponentGroupRef Id="UpdaterState" />
     </Feature>
 
     <UIRef Id="WixUI_InstallDir" />
@@ -70,7 +113,11 @@
   <Fragment>
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="RecordFS" />
+        <Directory Id="INSTALLFOLDER" Name="RecordFS">
+          <!-- Created by the updater service itself, with a DACL that only
+               SYSTEM and administrators can write through. -->
+          <Directory Id="UPDATESFOLDER" Name="updates" />
+        </Directory>
       </Directory>
     </Directory>
   </Fragment>
@@ -79,6 +126,23 @@
     <ComponentGroup Id="ProgramFiles" Directory="INSTALLFOLDER">
       <Component Id="recordfs.exe" Guid="*" Win64="yes">
         <File Id="recordfs.exe" Source="$(var.BinDirV)\recordfs.exe" KeyPath="yes" />
+        <!-- Automatic updates from the signed public releases (src/updater.cpp).
+             Same binary, service mode. MSI stops it before replacing the file
+             and starts it again afterwards; that restarted instance brings
+             the users' drives back. -->
+        <ServiceInstall Id="RecordFSUpdateService" Name="RecordFSUpdate"
+                        DisplayName="RecordFS Updater"
+                        Description="Keeps RecordFS up to date from its signed releases. AutoUpdate=0 under HKLM\SOFTWARE\RecordFS turns automatic updates off."
+                        Type="ownProcess" Start="auto" Account="LocalSystem"
+                        ErrorControl="normal" Arguments="update-service" Vital="yes">
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="60"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <ServiceControl Id="RecordFSUpdateControl" Name="RecordFSUpdate"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="libssl" Guid="*" Win64="yes">
         <File Id="libssl" Source="$(var.BinDirV)\libssl-3-x64.dll" KeyPath="yes" />
@@ -100,7 +164,22 @@
         <RegistryKey Root="HKLM" Key="SOFTWARE\RecordFS">
           <RegistryValue Name="DriveLetter" Type="string" Value="[DRIVELETTER]" />
           <RegistryValue Name="VolumeLabel" Type="string" Value="[VOLUMELABEL]" />
+          <RegistryValue Name="AutoUpdate" Type="integer" Value="[AUTOUPDATE]" />
         </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- The updater's state (HKLM\SOFTWARE\RecordFS\Updater) and its staging
+       folder go away with the product. -->
+  <Fragment>
+    <ComponentGroup Id="UpdaterState" Directory="UPDATESFOLDER">
+      <Component Id="updater_state" Guid="4F2B8C61-9D3E-4A57-B1C8-2E6F9A0D7C35" Win64="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\RecordFS\Updater" Name="Installed"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\RecordFS\Updater" Action="removeOnUninstall" />
+        <RemoveFile Id="updates_files" Name="*" On="uninstall" />
+        <RemoveFolder Id="updates_folder" On="uninstall" />
       </Component>
     </ComponentGroup>
   </Fragment>

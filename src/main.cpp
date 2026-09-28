@@ -3,6 +3,8 @@
 #include "config.h"
 #include "log.h"
 #include "probe.h"
+#include "updater.h"
+#include "version.h"
 
 #include <windows.h>
 #include <share.h>
@@ -22,11 +24,23 @@ namespace {
 // The exe is a WINDOWS-subsystem binary so the logon agent never flashes a
 // console; CLI use re-attaches to the invoking terminal's console instead,
 // and the headless agent worker logs to %LOCALAPPDATA%\RecordFS\agent.log.
+// A stream already redirected to a file or pipe (`recordfs version > v.txt`,
+// PowerShell capturing output) is kept: re-pointing it at the console would
+// silently throw the caller's capture away.
+bool redirected(DWORD which) {
+  HANDLE h = ::GetStdHandle(which);
+  if (!h || h == INVALID_HANDLE_VALUE) return false;
+  DWORD type = ::GetFileType(h);
+  return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+}
+
 void attach_parent_console(bool headless_worker) {
+  const bool out_redirected = redirected(STD_OUTPUT_HANDLE);
+  const bool err_redirected = redirected(STD_ERROR_HANDLE);
   if (!headless_worker && ::AttachConsole(ATTACH_PARENT_PROCESS)) {
     FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    freopen_s(&f, "CONOUT$", "w", stderr);
+    if (!out_redirected) freopen_s(&f, "CONOUT$", "w", stdout);
+    if (!err_redirected) freopen_s(&f, "CONOUT$", "w", stderr);
     freopen_s(&f, "CONIN$", "r", stdin);
     return;
   }
@@ -54,6 +68,11 @@ std::wstring own_path() {
 // clean exit (logoff, deliberate stop, WinFsp absent). All child output goes
 // to %LOCALAPPDATA%\RecordFS\agent.log.
 int run_supervisor(const rfs::Options& o) {
+  // One agent per session. The Run key starts one at every logon, and the
+  // updater restarts agents after installing; a second agent would only
+  // fight the first for the drive letter.
+  HANDLE single = ::CreateMutexW(nullptr, TRUE, L"Local\\RecordFS.Agent");
+  if (single && ::GetLastError() == ERROR_ALREADY_EXISTS) return 0;
   std::string logdir;
   {
     char* base = nullptr;
@@ -88,6 +107,7 @@ int run_supervisor(const rfs::Options& o) {
     ::CloseHandle(pi.hProcess);
     ::CloseHandle(pi.hThread);
     if (code == 0) return 0;  // clean stop — do not respawn
+    if (code == rfs::kExitForUpdate) return 0;  // the updater restarts us afterwards
     ::Sleep(5000);
   }
 }
@@ -105,6 +125,12 @@ int main(int argc, char** argv) {
       rfs::print_usage();
       return 0;
     }
+    if (o.command == "version") {
+      std::printf("recordfs %s\n", RECORDFS_VERSION);
+      return 0;
+    }
+    if (o.command == "update-service") return rfs::run_update_service();
+    if (o.command == "update-check") return rfs::run_update_check(o);
     if (o.command == "store-token") {
       // Record whatever the caller asked for, filled in from machine policy.
       rfs::resolve_drive_settings(o);

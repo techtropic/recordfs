@@ -23,6 +23,9 @@ p.add_argument("--password", default="claude'spassword")
 p.add_argument("--ttl-days", type=int, default=1)
 p.add_argument("--exe", default=os.path.join(os.path.dirname(__file__), "..", "x64", "Release",
                                              "recordfs.exe"))
+p.add_argument("--token-file", default=None,
+               help="write the token to this file instead of storing a profile (for a test "
+                    "machine that stores it itself, e.g. update_sandbox_e2e.py); delete it after")
 args = p.parse_args()
 
 
@@ -51,6 +54,11 @@ async def mint():
 
 
 token = asyncio.run(mint())
+if args.token_file:
+    with open(args.token_file, "w") as f:
+        f.write(token)
+    print("token written to", args.token_file)
+    sys.exit(0)
 r = subprocess.run([args.exe, "store-token", "--profile", args.profile, "--server", args.url,
                     "--token", token, "--drive", args.drive], capture_output=True, text=True)
 print("stored profile", args.profile, "->", args.url, args.drive, "rc", r.returncode)

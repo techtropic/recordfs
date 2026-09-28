@@ -18,6 +18,9 @@ void print_usage() {
     "  recordfs erase-token [--profile P]\n"
     "  recordfs mount       [--profile P] [--drive S:] [--volume Records]\n"
     "  recordfs agent       [--profile P]   (logon autostart: supervise + mount + retry)\n"
+    "  recordfs update-check [--feed URL]   (what an update would install, verified; changes nothing)\n"
+    "  recordfs update-check --apply        (elevated: have the updater service install it now)\n"
+    "  recordfs version\n"
     "\n"
     "drive letter and volume label default to machine policy\n"
     "(HKLM\\SOFTWARE\\RecordFS DriveLetter / VolumeLabel, set by the installer)\n"
@@ -46,11 +49,14 @@ std::optional<Options> parse_args(int argc, char** argv) {
     else if (a == "--key")    { auto* v = need("--key");     if (!v) return std::nullopt; o.key = v; }
     else if (a == "-v" || a == "--verbose") { o.verbose = true; }
     else if (a == "--insecure") { o.insecure = true; }
+    else if (a == "--feed")   { auto* v = need("--feed");    if (!v) return std::nullopt; o.feed = v; }
+    else if (a == "--apply")  { o.apply = true; }
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); print_usage(); return std::nullopt; }
   }
   if (o.command != "probe" && o.command != "store-token" && o.command != "erase-token" &&
       o.command != "mount" && o.command != "agent" && o.command != "agent-run" &&
-      o.command != "help") {
+      o.command != "help" && o.command != "version" && o.command != "update-check" &&
+      o.command != "update-service") {
     std::fprintf(stderr, "unknown command: %s\n", o.command.c_str());
     print_usage();
     return std::nullopt;

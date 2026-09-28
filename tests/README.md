@@ -191,3 +191,38 @@ Verified to have teeth against the previous build: the upper-case path is
 "not found", both collision checks create empty duplicate rows instead, a
 file cannot be created in a differently-cased folder, a case-only rename is
 refused, and renaming the 2.8 MB donor downloads all of it.
+
+## update_check_e2e.py (+ update_feed_mock.py)
+
+The updater's decisions, through `recordfs update-check` -- a dry run that
+downloads and verifies exactly as the service does and changes nothing --
+against `update_feed_mock.py`, a stand-in for the GitHub release API. A newer
+release is offered; an unsigned package is refused; so is a package validly
+signed by the RecordFS publisher that is not RecordFS (pass any such MSI,
+e.g. a Scheduler++ installer, as `--signed-other`); so are a size or SHA-256
+mismatch. Older, pre-release, suffixed (`-rc1`) and asset-less releases are
+not updates; a 404 feed explains itself; plain HTTP is refused off loopback.
+
+    python tests/update_check_e2e.py <dir with RecordFS-<ver>.msi> --exe <older recordfs.exe>
+                                     [--signed-other <signed non-RecordFS .msi>]
+
+Build test packages with `-p:RecordFSVersion=0.2.0` and `0.2.1` on the
+`SetupRecordFS` target; copy the OpenSSL DLLs next to the `--exe`.
+
+## update_sandbox_e2e.py (+ update_sandbox/)
+
+Install, automatic update and uninstall, end to end, in Windows Sandbox -- a
+disposable VM, so nothing is installed on the machine running it. The
+sandbox installs the prerequisites and the OLD package with site settings
+(drive R:, a custom label), mounts it against `--server`, holds a file open
+on the drive, and has the updater service install the NEW package from a
+local mock feed (`update_sandbox/mock.ps1`). Asserted: the update waited for
+the open file and started only after it closed; the new version is
+installed; the drive came back; drive letter and label were kept; the
+staging folder is admin-writable only; uninstall removes the service,
+staging folder, updater state and autostart.
+
+    python tests/update_sandbox_e2e.py --pkgs <dir> --from 0.2.0 --to 0.2.1
+
+Needs Windows Sandbox enabled (the window shows while it runs, 5-10
+minutes, and closes itself) and `SetupRecordFSBundle\redist` populated.

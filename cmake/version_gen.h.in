@@ -1,0 +1,6 @@
+// generated from VERSION.txt -- do not edit
+#ifndef RECORDFS_VERSION_GEN_H
+#define RECORDFS_VERSION_GEN_H
+#define RECORDFS_VERSION "@RECORDFS_VERSION@"
+#define RECORDFS_VER_COMMA @RECORDFS_VER_COMMA@
+#endif

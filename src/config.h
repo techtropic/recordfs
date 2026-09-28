@@ -18,7 +18,13 @@ struct Options {
   std::string key;                // probe: focus record key
   bool verbose = false;
   bool insecure = false;          // wss: skip certificate verification (dev only)
+  std::string feed;               // update-check: release feed override
+  bool apply = false;             // update-check: have the service install it
 };
+
+// agent-run's exit code when it stepped aside for an update: the supervisor
+// exits too (both hold recordfs.exe), and the updater restarts the agent.
+constexpr int kExitForUpdate = 3;
 
 // Parse argv. On error prints usage and returns nullopt.
 std::optional<Options> parse_args(int argc, char** argv);

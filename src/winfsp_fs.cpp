@@ -24,6 +24,7 @@
 #include "fsdclient.h"
 #include "log.h"
 #include "recordspace.h"
+#include "updater.h"
 #include "wsclient.h"
 
 #include <windows.h>
@@ -912,6 +913,9 @@ struct FsContext {  // per-open-handle
   int lease_access = 0;
   int lease_share = 0;
 
+  // Counted in g_open_files between the app's open and its close (Cleanup).
+  bool counted = false;
+
   FsContext() = default;
   FsContext(const FsContext&) = delete;
   FsContext& operator=(const FsContext&) = delete;
@@ -1098,8 +1102,30 @@ struct Volume {
 };
 Volume g_vol;
 
+// Files applications have open on this drive right now (directories are not
+// counted: an Explorer window holds its folder open indefinitely, and closing
+// one costs nothing). An update takes the drive down only at zero.
+std::atomic<int> g_open_files{0};
+
+void uncount(FsContext* ctx) {
+  if (ctx->counted) {
+    ctx->counted = false;
+    g_open_files.fetch_sub(1);
+  }
+}
+
+// Every successful Open/Create hands its context out through here.
+PVOID hand_out(std::unique_ptr<FsContext> ctx) {
+  if (ctx->res.kind == Resolved::File && !ctx->counted) {
+    ctx->counted = true;
+    g_open_files.fetch_add(1);
+  }
+  return ctx.release();
+}
+
 FsContext::~FsContext() {
   if (lease && g_vol.ns) g_vol.ns->release_lease(lease);
+  uncount(this);   // a Close that was never preceded by Cleanup
 }
 
 // Report a change under <table>\<record>\<inner> to anyone watching that
@@ -1404,7 +1430,7 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options,
       warn("mkdir " + inner + ": " + err);
     ctx->res.kind = Resolved::InnerDir;
     fill_file_info(ctx->res, info);
-    *file_context = ctx.release();
+    *file_context = hand_out(std::move(ctx));
     return STATUS_SUCCESS;
   }
 
@@ -1421,7 +1447,7 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options,
       return STATUS_IO_DEVICE_ERROR;
     }
     fill_eph_info(ctx.get(), info);
-    *file_context = ctx.release();
+    *file_context = hand_out(std::move(ctx));
     return STATUS_SUCCESS;
   }
 
@@ -1436,7 +1462,7 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options,
   ctx->dirty = true;
   ctx->mimetype = guess_mimetype(leaf);
   fill_work_info(ctx.get(), info);
-  *file_context = ctx.release();
+  *file_context = hand_out(std::move(ctx));
   return STATUS_SUCCESS;
 }
 
@@ -1662,6 +1688,8 @@ VOID SvcCleanup(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, ULONG flags) {
   // The handle is closing, so the file is free for the next editor on another
   // machine -- but only AFTER the save below has landed, so whoever opens it
   // next starts from this user's content, not the version before it.
+  // The same goes for counting it as open: an update may take the drive down
+  // the moment the count reaches zero, so it must not reach zero mid-save.
   struct ReleaseLeaseAfter {
     FsContext* c;
     ~ReleaseLeaseAfter() {
@@ -1669,6 +1697,7 @@ VOID SvcCleanup(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR, ULONG flags) {
         g_vol.ns->release_lease(c->lease);
         c->lease = 0;
       }
+      uncount(c);
     }
   } release_after{ctx};
 
@@ -1758,7 +1787,7 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
     ctx->eph_buf = std::move(*bytes);
     ctx->res.inner = r->file->path;
     fill_eph_info(ctx.get(), info);
-    *file_context = ctx.release();
+    *file_context = hand_out(std::move(ctx));
     return STATUS_SUCCESS;
   }
 
@@ -1774,7 +1803,7 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
     // content is missing impossible even to delete.
     if (!data_read && !data_write) {
       fill_file_info(*r, info);
-      *file_context = ctx.release();
+      *file_context = hand_out(std::move(ctx));
       return STATUS_SUCCESS;
     }
 
@@ -1800,7 +1829,7 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
         return STATUS_IO_DEVICE_ERROR;
       }
       fill_work_info(ctx.get(), info);
-      *file_context = ctx.release();
+      *file_context = hand_out(std::move(ctx));
       return STATUS_SUCCESS;
     }
     ctx->local = ::CreateFileW(local->c_str(), GENERIC_READ,
@@ -1809,7 +1838,7 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
     if (ctx->local == INVALID_HANDLE_VALUE) return STATUS_IO_DEVICE_ERROR;
   }
   fill_file_info(*r, info);
-  *file_context = ctx.release();
+  *file_context = hand_out(std::move(ctx));
   return STATUS_SUCCESS;
 }
 
@@ -2224,8 +2253,29 @@ int run_agent(const Options& base) {
   g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
   HANDLE waits[2] = {g_stop_event, cred_event};
-  auto stopped = [&](DWORD timeout_ms) {
-    return ::WaitForMultipleObjects(2, waits, FALSE, timeout_ms) == WAIT_OBJECT_0;
+
+  // The updater asks every agent to step aside before it replaces
+  // recordfs.exe (updater.cpp). With nothing mounted there is nothing to
+  // protect, so an idle wait simply ends; the updater restarts us afterwards.
+  UpdateSignal update;
+  enum class Wake { Timeout, Stop, Update };
+  auto idle_wait = [&](DWORD timeout_ms) {
+    // In short slices: the update signal is a manual-reset event that stays
+    // set for the whole update, so it cannot sit in the wait set itself.
+    auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+      if (update.pending()) return Wake::Update;
+      auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          until - std::chrono::steady_clock::now()).count();
+      if (left <= 0) return Wake::Timeout;
+      DWORD w = ::WaitForMultipleObjects(2, waits, FALSE, (DWORD)std::min<long long>(left, 2000));
+      if (w == WAIT_OBJECT_0) return Wake::Stop;
+      if (w == WAIT_OBJECT_0 + 1) return Wake::Timeout;   // fresh credentials: go now
+    }
+  };
+  auto leave_for_update = [&]() {
+    info("agent: stepping aside for a RecordFS update");
+    return kExitForUpdate;
   };
 
   int backoff = 5;
@@ -2235,7 +2285,9 @@ int run_agent(const Options& base) {
     o.token.clear();  // agent trusts the store only — always re-read it
     if (!resolve_credentials(o)) {
       info("agent: no stored credentials — waiting (log into Scheduler++ once)");
-      if (stopped(60000)) return 0;
+      Wake w = idle_wait(60000);
+      if (w == Wake::Stop) return 0;
+      if (w == Wake::Update) return leave_for_update();
       continue;
     }
     resolve_drive_settings(o);   // profile first, then machine policy
@@ -2243,7 +2295,9 @@ int run_agent(const Options& base) {
       WsClient ws(o.server, o.insecure);
       if (!ws.login(o.token)) {
         warn("agent: token rejected (revoked/expired) — waiting for fresh credentials");
-        if (stopped(300000)) return 0;
+        Wake w = idle_wait(300000);
+        if (w == Wake::Stop) return 0;
+        if (w == Wake::Update) return leave_for_update();
         continue;
       }
       ws.refresh_client_token(o.token);
@@ -2257,13 +2311,31 @@ int run_agent(const Options& base) {
       start_notify_pump(ns);
       backoff = 5;
 
-      // Supervise: liveness probe every 30 s; token refresh daily.
+      // Supervise: liveness probe every 30 s; token refresh daily; and step
+      // aside for an update -- but only once nothing is open on the drive.
       int ticks = 0;
+      int waiting_on = -1;
+      auto last_probe = std::chrono::steady_clock::now();
       for (;;) {
-        if (::WaitForSingleObject(g_stop_event, 30000) == WAIT_OBJECT_0) {
+        if (::WaitForSingleObject(g_stop_event, 2000) == WAIT_OBJECT_0) {
           unmount_volume(fs);
           return 0;
         }
+        if (update.pending()) {
+          int open = g_open_files.load();
+          if (open <= 0) {
+            unmount_volume(fs);
+            return leave_for_update();
+          }
+          if (open != waiting_on)
+            info("agent: an update is waiting for " + std::to_string(open) +
+                 " open file(s) on the drive to be closed");
+          waiting_on = open;
+        } else {
+          waiting_on = -1;
+        }
+        if (std::chrono::steady_clock::now() - last_probe < std::chrono::seconds(30)) continue;
+        last_probe = std::chrono::steady_clock::now();
         try {
           ws.request("get_current_stamp", nlohmann::json::object());
           if (++ticks >= 2880) {  // ~daily
@@ -2279,7 +2351,9 @@ int run_agent(const Options& base) {
     } catch (const std::exception& e) {
       warn(std::string("agent: ") + e.what());
     }
-    if (stopped(backoff * 1000)) return 0;
+    Wake w = idle_wait(backoff * 1000);
+    if (w == Wake::Stop) return 0;
+    if (w == Wake::Update) return leave_for_update();
     backoff = std::min(backoff * 2, 60);
   }
 }

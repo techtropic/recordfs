@@ -25,7 +25,7 @@
   <!-- Version SSOT: repo-root VERSION.txt (shared with the exe + bundle).
        BinDir points the .wxs at the matching recordfs build output. -->
   <PropertyGroup>
-    <RecordFSVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION.txt').Trim())</RecordFSVersion>
+    <RecordFSVersion Condition="'$(RecordFSVersion)'==''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION.txt').Trim())</RecordFSVersion>
     <DefineConstants>$(DefineConstants);RecordFSVersion=$(RecordFSVersion);BinDir=..\x64\$(Configuration)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
@@ -35,6 +35,10 @@
     <WixExtension Include="WixUIExtension">
       <HintPath>$(WixExtDir)\WixUIExtension.dll</HintPath>
       <Name>WixUIExtension</Name>
+    </WixExtension>
+    <WixExtension Include="WixUtilExtension">
+      <HintPath>$(WixExtDir)\WixUtilExtension.dll</HintPath>
+      <Name>WixUtilExtension</Name>
     </WixExtension>
   </ItemGroup>
   <ItemGroup>

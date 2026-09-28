@@ -18,8 +18,9 @@ lost on a desktop, and everything for a job lives with the job.
 
 Pre-1.0, in field testing. The drive browses, opens, and saves in place
 (write-back through content-addressed uploads), honours the server's table
-and per-file permissions, and behaves like a shared drive when several
-people work on the same records (below). The wire contract is
+and per-file permissions, behaves like a shared drive when several people
+work on the same records (below), and keeps itself up to date from signed
+releases ([Updates](#updates)). The wire contract is
 [docs/protocol.md](docs/protocol.md).
 
 ## Several people, one file
@@ -130,12 +131,67 @@ recordfs store-token --server ws://host:7243/ --token <mount token> [--drive S:]
 
 recordfs mount [--profile default]
     Mount the drive using stored credentials. (Requires WinFsp.)
+
+recordfs update-check [--feed URL]
+    What an automatic update would install right now, downloaded and fully
+    verified; changes nothing.
+
+recordfs update-check --apply
+    (Elevated.) Ask the updater service to check and install now.
+
+recordfs version
 ```
 
 Mount tokens are minted by the server for an authenticated user (in
 Scheduler++: automatically at desktop login, or by an administrator). RecordFS
 never sees or stores a password, and a token can be revoked server-side at any
 time.
+
+## Updates
+
+RecordFS keeps itself up to date. The installer adds a small service,
+**RecordFS Updater** (`RecordFSUpdate`, running as LocalSystem), that reads
+this project's GitHub releases about twice a day and installs a newer
+`RecordFS*.msi` when one is published.
+
+- **What it trusts.** A package is installed only if it is Authenticode-signed
+  by the RecordFS publisher (Techtropic Inc.), it is a RecordFS package (by
+  UpgradeCode), and its own version is newer than the installed one. GitHub is
+  only the transport: a tampered release or feed can neither install
+  something else nor roll a machine back.
+- **Open files come first.** Each user's drive steps aside only once nothing
+  is open on it. While anything is, the update waits and tries again later;
+  nobody's open document is pulled out from under them. Afterwards the
+  updater brings the drive back in every logged-on session.
+- **Site settings are kept.** Drive letter, volume label and the update
+  setting survive upgrades.
+- **Opting out.** Install with `AUTOUPDATE=0` (`msiexec /i RecordFS.msi
+  AUTOUPDATE=0`, or the same on `RecordFSSetup.exe`), or set `AutoUpdate` = 0
+  (DWORD) under `HKLM\SOFTWARE\RecordFS`. The service stays installed but idle.
+- **Other policy values** under `HKLM\SOFTWARE\RecordFS`: `UpdateFeed` (a
+  mirror of the release API), `UpdateIntervalHours`. `UpdateAllowUnsigned`
+  exists for test machines only.
+- The service logs to `<install folder>\updates\updater.log`, next to the
+  installer log of every update it ran.
+- Only RecordFS itself is updated this way. WinFsp and the VC++ runtime are
+  updated by running a newer setup bundle: a driver update takes every mount
+  down and usually needs a restart.
+
+## Releasing
+
+1. Raise `VERSION.txt`. Every release needs a higher version: MSI upgrades
+   only upward, and the updater refuses anything that is not newer.
+2. Build the `Release Signed` configuration, which signs the exe, the MSI and
+   the setup bundle.
+3. Tag `vX.Y.Z` and publish a GitHub release (not a draft, not a
+   pre-release: machines ignore those) with the MSI as `RecordFS-X.Y.Z.msi`
+   and, for new installs, the bundle as `RecordFSSetup-X.Y.Z.exe`.
+4. The releases must be public. The updater reads the release API
+   anonymously, and a private repository answers 404.
+
+To try a release candidate without publishing it, use a pre-release (the
+updater skips it) or point a test machine's `UpdateFeed` at a copy of the
+release JSON; `tests/update_feed_mock.py` serves one.
 
 ## License
 

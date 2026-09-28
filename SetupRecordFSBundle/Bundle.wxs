@@ -21,7 +21,7 @@
   <Bundle Name="RecordFS Setup"
           Version="$(var.RecordFSVersion)"
           Manufacturer="Techtropic Inc."
-          AboutUrl="https://github.com/marcmicalizzi/recordfs"
+          AboutUrl="https://github.com/techtropic/recordfs"
           UpgradeCode="0A7D21E6-84C3-4E5B-9F1A-6D2B58C7A934">
 
     <BootstrapperApplicationRef Id="WixStandardBootstrapperApplication.RtfLicense">
@@ -40,9 +40,13 @@
                          Result="value" />
 
     <!-- Bundle variables of the same names, so they can be supplied on the
-         bundle command line and forwarded to the MSI below. -->
-    <Variable Name="DriveLetter" Value="S:" Type="string" bal:Overridable="yes" />
-    <Variable Name="VolumeLabel" Value="Records" Type="string" bal:Overridable="yes" />
+         bundle command line and forwarded to the MSI below. Deliberately no
+         defaults: an empty value lets the MSI keep what the machine already
+         has (and fall back to its own defaults), so re-running the bundle
+         never resets a site's drive letter. -->
+    <Variable Name="DriveLetter" bal:Overridable="yes" />
+    <Variable Name="VolumeLabel" bal:Overridable="yes" />
+    <Variable Name="AutoUpdate" bal:Overridable="yes" />
 
     <Chain>
       <ExePackage Id="VCRedist"
@@ -76,6 +80,7 @@
              works exactly like the msiexec form. -->
         <MsiProperty Name="DRIVELETTER" Value="[DriveLetter]" />
         <MsiProperty Name="VOLUMELABEL" Value="[VolumeLabel]" />
+        <MsiProperty Name="AUTOUPDATE" Value="[AutoUpdate]" />
       </MsiPackage>
     </Chain>
   </Bundle>

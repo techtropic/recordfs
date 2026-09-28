@@ -2,7 +2,13 @@
 # Copyright (C) 2026 Marc Micalizzi
 # SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.24)
-project(recordfs VERSION 0.1.0 LANGUAGES CXX)
+# Version SSOT: VERSION.txt (shared with the MSBuild build and the installers).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" RECORDFS_VERSION LIMIT_COUNT 1)
+string(STRIP "${RECORDFS_VERSION}" RECORDFS_VERSION)
+project(recordfs VERSION ${RECORDFS_VERSION} LANGUAGES CXX RC)
+string(REPLACE "." "," RECORDFS_VER_COMMA "${RECORDFS_VERSION}")
+set(RECORDFS_VER_COMMA "${RECORDFS_VER_COMMA},0")
+configure_file(cmake/version_gen.h.in ${CMAKE_CURRENT_BINARY_DIR}/version_gen.h @ONLY)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,13 +31,15 @@ add_executable(recordfs
   src/recordspace.cpp
   src/filecache.cpp
   src/probe.cpp
+  src/updater.cpp
+  src/recordfs.rc
 )
-target_include_directories(recordfs PRIVATE src shared)
+target_include_directories(recordfs PRIVATE src shared ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(recordfs PRIVATE
   OpenSSL::SSL OpenSSL::Crypto
   nlohmann_json::nlohmann_json
   Boost::headers
-  ws2_32 crypt32 advapi32)
+  ws2_32 crypt32 advapi32 winhttp wintrust msi wtsapi32 userenv)
 target_compile_definitions(recordfs PRIVATE
   _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)

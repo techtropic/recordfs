@@ -41,25 +41,33 @@
     <VcpkgRoot>$(SolutionDir)vcpkg_installed\x64-windows\x64-windows</VcpkgRoot>
     <WinFspRoot>$(MSBuildProgramFiles32)\WinFsp</WinFspRoot>
   </PropertyGroup>
+  <!-- Version SSOT: repo-root VERSION.txt. -p:RecordFSVersion=X.Y.Z overrides
+       it for one build (test packages for the updater). -->
+  <PropertyGroup>
+    <RecordFSVersion Condition="'$(RecordFSVersion)'==''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)VERSION.txt').Trim())</RecordFSVersion>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0A00;RECORDFS_HAVE_WINFSP=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>src;shared;$(VcpkgRoot)\include;$(WinFspRoot)\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;shared;$(IntDir);$(VcpkgRoot)\include;$(WinFspRoot)\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
       <ExceptionHandling>Sync</ExceptionHandling>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <!-- 4324: WinFsp's fsctl.h deliberately pads an aligned struct. -->
       <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
     <Link>
       <!-- WINDOWS subsystem + main() entry: the logon agent must never flash
            a console; CLI runs re-attach to the caller's console (main.cpp). -->
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <AdditionalLibraryDirectories>$(VcpkgRoot)\lib;$(WinFspRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libssl.lib;libcrypto.lib;winfsp-x64.lib;delayimp.lib;ws2_32.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libssl.lib;libcrypto.lib;winfsp-x64.lib;delayimp.lib;ws2_32.lib;crypt32.lib;advapi32.lib;winhttp.lib;wintrust.lib;msi.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- WinFsp guidance: delay-load and resolve via FspLoad() so the exe
            still starts (mount disabled) where WinFsp is not installed. -->
       <DelayLoadDLLs>winfsp-x64.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
@@ -102,6 +110,16 @@
 "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /tr http://timestamp.acs.microsoft.com /td sha256 /fd sha256 /dlib "C:\Program Files\MicrosoftTrustedSigningClientTools\Azure.CodeSigning.Dlib.dll" /dmdf "$(SolutionDir)tsmetadata.json" "$(TargetPath)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
+  <!-- version_gen.h: the version as a C string and as the resource's
+       four-part FILEVERSION ("0.2.1" -> 0,2,1,0). -->
+  <Target Name="GenerateVersionHeader" BeforeTargets="ClCompile;ResourceCompile">
+    <PropertyGroup>
+      <RecordFSVersionComma>$(RecordFSVersion.Replace('.', ',')),0</RecordFSVersionComma>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)version_gen.h" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="// generated from VERSION.txt -- do not edit;#ifndef RECORDFS_VERSION_GEN_H;#define RECORDFS_VERSION_GEN_H;#define RECORDFS_VERSION &quot;$(RecordFSVersion)&quot;;#define RECORDFS_VER_COMMA $(RecordFSVersionComma);#endif" />
+  </Target>
   <Target Name="StageRuntimeDlls" AfterTargets="Build">
     <ItemGroup>
       <RuntimeDll Include="$(VcpkgRoot)\bin\libssl-3-x64.dll;$(VcpkgRoot)\bin\libcrypto-3-x64.dll" />
@@ -118,6 +136,7 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\probe.cpp" />
     <ClCompile Include="src\recordspace.cpp" />
+    <ClCompile Include="src\updater.cpp" />
     <ClCompile Include="src\winfsp_fs.cpp" />
     <ClCompile Include="src\wsclient.cpp" />
   </ItemGroup>
@@ -128,8 +147,13 @@
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\probe.h" />
     <ClInclude Include="src\recordspace.h" />
+    <ClInclude Include="src\updater.h" />
+    <ClInclude Include="src\version.h" />
     <ClInclude Include="src\wsclient.h" />
     <ClInclude Include="shared\record_mount_credentials.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\recordfs.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

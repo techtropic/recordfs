@@ -23,7 +23,7 @@
     <IntermediateOutputPath>obj\$(Configuration)\</IntermediateOutputPath>
   </PropertyGroup>
   <PropertyGroup>
-    <RecordFSVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION.txt').Trim())</RecordFSVersion>
+    <RecordFSVersion Condition="'$(RecordFSVersion)'==''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION.txt').Trim())</RecordFSVersion>
     <DefineConstants>$(DefineConstants);RecordFSVersion=$(RecordFSVersion)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
