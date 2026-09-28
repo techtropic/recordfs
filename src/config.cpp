@@ -21,7 +21,10 @@ void print_usage() {
     "\n"
     "drive letter and volume label default to machine policy\n"
     "(HKLM\\SOFTWARE\\RecordFS DriveLetter / VolumeLabel, set by the installer)\n"
-    "and fall back to S: and \"Records\".\n");
+    "and fall back to S: and \"Records\".\n"
+    "\n"
+    "RecordFS uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos\n"
+    "https://github.com/winfsp/winfsp\n");
 }
 
 std::optional<Options> parse_args(int argc, char** argv) {

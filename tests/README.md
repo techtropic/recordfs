@@ -4,6 +4,30 @@ End-to-end tests that drive a **live mount** against a running server. They
 are not unit tests: they need a mounted drive and a reachable server, so they
 live outside the build.
 
+## Setup
+
+Point the tests at a server with `RECORDFS_TEST_SERVER` (default
+`ws://127.0.0.1:17243/`). Anything that uploads needs a server **with its
+file service**; use the deployment's own server for that (for Scheduler++
+testing: `wss://testing.scheduler.techtropic.ca:7243/`), never a second
+server with a separate blob store on the same database -- every row it
+writes dangles for the other deployment. A local server is fine for the
+tests that upload nothing (`lease_protocol_e2e.py`, `file_in_use_e2e.py`)
+if it has no file service of its own.
+
+Mount a profile per drive:
+
+    python tests/mint_profile.py <server-url> caseA S:
+    recordfs agent-run --profile caseA
+
+`mint_profile.py` logs in with the testing login, mints a one-day mount
+token, and stores it with `recordfs store-token` without printing it. Give
+each mount its own `LOCALAPPDATA` when a test needs two machines (separate
+log, cache, and working area). Remove with `recordfs erase-token --profile`.
+
+The tests below that name a local console (`17244`) need a server you run
+yourself; the rest take `RECORDFS_TEST_SERVER`.
+
 ## rename_grace_e2e.py
 
 Covers the former-names grace map: a record renamed while an application
@@ -146,3 +170,24 @@ the "Notify" path). Only Excel processes the script started are ever
 stopped. Measured: B's Excel is refused the owner file (`~$<name>`) first
 and falls back to read-only from that -- the lock-file lease is load-bearing,
 not just the document's.
+
+## case_and_metadata_e2e.py
+
+Names on the drive are case-insensitive, as on any Windows volume: an
+upper-case path reads and stats the stored file, the listing keeps the
+stored spelling, `CREATE_NEW` on an existing name in another case collides,
+`OPEN_ALWAYS` through another case opens the SAME attachment (no second
+row), a file created under `CASEDIR\` lands in the existing `CaseDir`
+folder, `mkdir` of an existing folder in another case is refused, and a
+case-only rename renames rather than deleting the file. Then opens that
+touch no bytes: renaming, stat-ing and deleting a file whose content is not
+cached must succeed without downloading it (it borrows the largest jpg on
+record `--donor` by adding a second row pointing at the same content, and
+evicts that blob from the mount's cache first).
+
+    python tests/case_and_metadata_e2e.py --server <url> --cache <mount's cache dir>
+
+Verified to have teeth against the previous build: the upper-case path is
+"not found", both collision checks create empty duplicate rows instead, a
+file cannot be created in a differently-cased folder, a case-only rename is
+refused, and renaming the 2.8 MB donor downloads all of it.

@@ -7,7 +7,7 @@ durable attachment writes stay refused. Run as rotest (read-only on quote).
 import asyncio, json, os, sys, time
 import websockets
 
-SRV = "ws://127.0.0.1:17243/"
+SRV = os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 passed, failed = [], []
 
 

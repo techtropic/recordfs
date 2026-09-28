@@ -8,7 +8,7 @@ fetch on every access.
 import asyncio, ctypes, hashlib, json, os, sys, time
 import websockets
 
-SRV = "ws://127.0.0.1:17243/"
+SRV = os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 KEY = 50049
 ROOT = "S:\\workorders"
 NAME = "dangling-check.bin"

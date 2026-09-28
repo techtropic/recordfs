@@ -3,7 +3,7 @@ list_tables can_write flags, and a rejected add_attachment on quote vs an
 accepted one on workorders."""
 import asyncio, hashlib, json, os, sys, time
 import websockets
-SRV="ws://127.0.0.1:17243/"
+SRV=os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 TOK=open("C:/Users/marcm/AppData/Local/Temp/rotest_tok.txt").read().strip()
 passed,failed=[],[]
 def check(n,c,d=""):

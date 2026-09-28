@@ -1,9 +1,9 @@
 """Replace peerwatch.txt's content the way another machine would: upload a
 new blob and re-point the attachment row. Never touches this machine's FS."""
-import asyncio, http.client, json, ssl, time
+import os, asyncio, http.client, json, ssl, time
 import websockets
 
-SRV = "ws://127.0.0.1:17243/"
+SRV = os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 KEY = 50049
 NAME = "peerwatch.txt"
 NEW = b"PEER REPLACED THIS CONTENT AND IT IS MUCH LONGER THAN THE SEED " + b"z" * 500

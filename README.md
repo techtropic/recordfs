@@ -141,6 +141,9 @@ time.
 
 RecordFS is licensed under the **MIT License** — see [LICENSE](LICENSE).
 
+RecordFS uses **WinFsp - Windows File System Proxy, Copyright (C) Bill
+Zissimopoulos** — <https://github.com/winfsp/winfsp>.
+
 It links against [WinFsp](https://winfsp.dev), which is GPLv3 with a FLOSS
 exception permitting use by open-source projects under OSI-approved licenses
 (MIT qualifies). The installer chains WinFsp's own unmodified, signed

@@ -28,6 +28,12 @@ std::string object_dir_name(const std::string& key, const std::string& display) 
   return d;
 }
 
+std::string fold_name(std::string s) {
+  for (auto& c : s)
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+  return s;
+}
+
 namespace {
 // "photos/install-1.jpg" -> {"photos", "install-1.jpg"}; tolerates leading
 // '/', backslashes, and duplicate separators.
@@ -65,32 +71,38 @@ void FileTree::build(std::vector<FileEntry> entries) {
     e.is_dir = e.is_dir || e.mimetype == "inode/directory";
     auto parts = split_path(e.path);
     if (parts.empty()) continue;
-    e.path = join_dir(parts, parts.size());  // canonical form
-    // Intermediate components are directories.
+    e.path = join_dir(parts, parts.size());  // canonical separators, stored case
+    std::vector<std::string> folded;
+    folded.reserve(parts.size());
+    for (const auto& part : parts) folded.push_back(fold_name(part));
+    // Intermediate components are directories. emplace keeps the first
+    // spelling seen for a directory several paths share.
     for (size_t d = 0; d + 1 < parts.size(); ++d) {
-      dirs_[join_dir(parts, d)].emplace(parts[d], SIZE_MAX);
-      dirs_[join_dir(parts, d + 1)];
+      dirs_[join_dir(folded, d)].emplace(folded[d], Slot{parts[d], SIZE_MAX});
+      dirs_[join_dir(folded, d + 1)];
     }
-    std::string parent = join_dir(parts, parts.size() - 1);
+    std::string parent = join_dir(folded, parts.size() - 1);
     if (e.is_dir) {
-      dirs_[parent].emplace(parts.back(), SIZE_MAX);
-      dirs_[e.path];
+      dirs_[parent].emplace(folded.back(), Slot{parts.back(), SIZE_MAX});
+      dirs_[join_dir(folded, folded.size())];
     } else {
-      dirs_[parent][parts.back()] = i;  // file wins over implied dir of same name
+      dirs_[parent][folded.back()] = Slot{parts.back(), i};  // file wins over implied dir
     }
   }
 }
 
 std::vector<FileTree::Child> FileTree::list(const std::string& dir) const {
   std::vector<Child> out;
-  auto it = dirs_.find(dir);
+  auto parts = split_path(dir);
+  for (auto& part : parts) part = fold_name(part);
+  auto it = dirs_.find(join_dir(parts, parts.size()));
   if (it == dirs_.end()) return out;
   out.reserve(it->second.size());
-  for (const auto& [name, idx] : it->second) {
+  for (const auto& [folded, slot] : it->second) {
     Child c;
-    c.name = name;
-    c.is_dir = idx == SIZE_MAX;
-    c.file = c.is_dir ? nullptr : &entries_[idx];
+    c.name = slot.name;
+    c.is_dir = slot.idx == SIZE_MAX;
+    c.file = c.is_dir ? nullptr : &entries_[slot.idx];
     out.push_back(std::move(c));
   }
   return out;
@@ -103,16 +115,34 @@ std::optional<FileTree::Child> FileTree::find(const std::string& path) const {
     root.is_dir = true;
     return root;
   }
-  std::string parent = join_dir(parts, parts.size() - 1);
-  auto it = dirs_.find(parent);
+  for (auto& part : parts) part = fold_name(part);
+  auto it = dirs_.find(join_dir(parts, parts.size() - 1));
   if (it == dirs_.end()) return std::nullopt;
   auto ct = it->second.find(parts.back());
   if (ct == it->second.end()) return std::nullopt;
   Child c;
-  c.name = ct->first;
-  c.is_dir = ct->second == SIZE_MAX;
-  c.file = c.is_dir ? nullptr : &entries_[ct->second];
+  c.name = ct->second.name;
+  c.is_dir = ct->second.idx == SIZE_MAX;
+  c.file = c.is_dir ? nullptr : &entries_[ct->second.idx];
   return c;
+}
+
+std::string FileTree::canonical(const std::string& path) const {
+  auto parts = split_path(path);
+  std::vector<std::string> folded;
+  std::string out;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    std::string name = parts[i];
+    auto it = dirs_.find(join_dir(folded, folded.size()));
+    if (it != dirs_.end()) {
+      auto ct = it->second.find(fold_name(parts[i]));
+      if (ct != it->second.end()) name = ct->second.name;
+    }
+    if (i) out.push_back('/');
+    out += name;
+    folded.push_back(fold_name(parts[i]));
+  }
+  return out;
 }
 
 }  // namespace rfs

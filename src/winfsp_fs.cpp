@@ -871,7 +871,7 @@ std::optional<Resolved> resolve(NamespaceService& ns, const wchar_t* wpath) {
   }
   auto child = r.tree->find(inner);
   if (!child) return std::nullopt;
-  r.inner = inner;
+  r.inner = r.tree->canonical(inner);   // stored spelling, whatever was typed
   if (child->is_dir) {
     r.kind = Resolved::InnerDir;
   } else {
@@ -922,8 +922,7 @@ struct FsContext {  // per-open-handle
 };
 
 // Per-open working copy under %LOCALAPPDATA%\RecordFS\work.
-std::filesystem::path new_work_path() {
-  static std::atomic<uint64_t> seq{0};
+std::filesystem::path work_dir() {
   std::filesystem::path dir;
   char* base = nullptr;
   size_t len = 0;
@@ -935,8 +934,79 @@ std::filesystem::path new_work_path() {
   }
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  return dir / (std::to_string(::GetCurrentProcessId()) + "-" +
-                std::to_string(seq.fetch_add(1)) + ".work");
+  return dir;
+}
+
+std::filesystem::path new_work_path() {
+  static std::atomic<uint64_t> seq{0};
+  return work_dir() / (std::to_string(::GetCurrentProcessId()) + "-" +
+                       std::to_string(seq.fetch_add(1)) + ".work");
+}
+
+// Whether `pid` is a running recordfs process. Unknown (we may not inspect
+// it) counts as running: the sweep below must never touch a live copy.
+bool recordfs_process_alive(DWORD pid) {
+  HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return ::GetLastError() != ERROR_INVALID_PARAMETER;   // no such pid = gone
+  DWORD code = 0;
+  bool alive = ::GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+  if (alive) {
+    wchar_t image[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (::QueryFullProcessImageNameW(h, 0, image, &n)) {
+      std::wstring img(image, n);
+      for (auto& c : img) c = (wchar_t)::towlower(c);
+      alive = img.size() >= 12 && img.compare(img.size() - 12, 12, L"recordfs.exe") == 0;
+    }
+  }
+  ::CloseHandle(h);
+  return alive;
+}
+
+// Working copies left by a recordfs that is no longer running (killed, crashed,
+// or a failed upload). A running mount discards its own at close, so these
+// would otherwise pile up forever. An unmodified copy-up -- bytes identical to
+// a cached blob -- or an empty one holds nothing and is removed. Anything else
+// may be the only copy of someone's unsaved edit: it is moved to a
+// "recovered" folder beside the working area and named in the log, never
+// deleted.
+void sweep_orphan_work(const FileCache& cache) {
+  auto dir = work_dir();
+  auto recovered = dir.parent_path() / "recovered";
+  std::error_code ec;
+  for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+    if (!de.is_regular_file(ec) || de.path().extension() != ".work") continue;
+    std::string stem = de.path().stem().string();
+    auto dash = stem.find('-');
+    DWORD pid = 0;
+    try {
+      pid = (DWORD)std::stoul(stem.substr(0, dash));
+    } catch (...) {
+      continue;
+    }
+    if (pid == ::GetCurrentProcessId() || recordfs_process_alive(pid)) continue;
+    auto size = de.file_size(ec);
+    if (!ec && size == 0) {
+      std::filesystem::remove(de.path(), ec);
+      continue;
+    }
+    std::string hex = sha256_hex_of_file(de.path());
+    if (!hex.empty() && cache.present("sha256:" + hex)) {
+      std::filesystem::remove(de.path(), ec);
+      continue;
+    }
+    std::filesystem::create_directories(recovered, ec);
+    SYSTEMTIME st;
+    ::GetLocalTime(&st);
+    char stamp[32];
+    sprintf_s(stamp, "%04u%02u%02u-%02u%02u%02u-", st.wYear, st.wMonth, st.wDay, st.wHour,
+              st.wMinute, st.wSecond);
+    auto dest = recovered / (std::string(stamp) + de.path().filename().string());
+    std::filesystem::rename(de.path(), dest, ec);
+    if (!ec)
+      warn("recovered a working copy that was never saved back (" + std::to_string(size) +
+           " bytes, from a recordfs that is no longer running): " + dest.string());
+  }
 }
 
 // The server stores mimetype in a 64-char column, and the official
@@ -1253,7 +1323,11 @@ constexpr size_t kEphMaxBytes = 1 << 20;  // matches the server-side cap
 // call CreateDirectory then immediately create inside it).
 // The Create/Open/Overwrite trio must all exist or the WinFsp Create
 // dispatcher refuses every open with IoStatus=c0000010.
-NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options,
+NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR, UINT32, UINT32, PVOID*, FSP_FSCTL_FILE_INFO*);
+NTSTATUS SvcOverwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO*);
+VOID SvcClose(FSP_FILE_SYSTEM*, PVOID);
+
+NTSTATUS SvcCreate(FSP_FILE_SYSTEM* fs, PWSTR file_name, UINT32 create_options,
                    UINT32 granted_access, UINT32, PSECURITY_DESCRIPTOR, UINT64,
                    PVOID* file_context, FSP_FSCTL_FILE_INFO* info) {
   std::string full = narrow(file_name);
@@ -1286,22 +1360,48 @@ NTSTATUS SvcCreate(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32 create_options,
   ctx->res.kind = Resolved::File;
   ctx->res.table = table;
   ctx->res.object = *obj;
-  ctx->res.inner = inner;
   ctx->res.tree = g_vol.ns->files(table, *obj);
+
+  // The name must not exist. Create is reached directly for CREATE_NEW (only
+  // the *_IF dispositions try Open first), and the cached listing can miss a
+  // file another machine has just saved, so ask the server before adding a
+  // second attachment -- or a second folder row -- under an existing name.
+  // Names compare case-insensitively, like everywhere on the drive.
+  try {
+    ctx->res.tree = g_vol.ns->files_locked(table, *obj, true);
+  } catch (const std::exception&) {
+    // Keep the cached listing; the save-time check backstops a durable file.
+  }
+  if (ctx->res.tree && ctx->res.tree->find(inner)) {
+    // Taken. For CREATE_NEW that is the answer. OPEN_IF / OVERWRITE_IF /
+    // SUPERSEDE only get here because Open missed the name in the cached
+    // listing -- another machine saved it since -- so do what they asked
+    // for: open it (and truncate it, for the overwriting two).
+    const UINT32 disposition =
+        FspFileSystemGetOperationContext()->Request->Req.Create.CreateOptions >> 24;
+    constexpr UINT32 kSupersede = 0, kOpenIf = 3, kOverwriteIf = 5;
+    if (disposition != kOpenIf && disposition != kOverwriteIf && disposition != kSupersede)
+      return STATUS_OBJECT_NAME_COLLISION;
+    ctx.reset();
+    NTSTATUS st = SvcOpen(fs, file_name, create_options, granted_access, file_context, info);
+    if (NT_SUCCESS(st) && disposition != kOpenIf) {
+      st = SvcOverwrite(fs, *file_context, 0, disposition == kSupersede, 0, info);
+      if (!NT_SUCCESS(st)) SvcClose(fs, *file_context);
+    }
+    return st;
+  }
+  // Folders that already exist keep their stored spelling: "PHOTOS/new.jpg"
+  // lands in "photos", not in a case-variant twin of it.
+  if (ctx->res.tree) inner = ctx->res.tree->canonical(inner);
+  ctx->res.inner = inner;
 
   if (create_options & FILE_DIRECTORY_FILE) {
     // Persist an explicit directory row (the shape the desktop writes, and
     // exempt from the byte-plane location check server-side) so an empty
-    // folder survives until something lands in it. Only when it does not
-    // already exist -- either as its own row or implied by some attachment's
-    // path -- otherwise every CreateDirectory on an existing folder would
-    // add ANOTHER row, and one rmdir would leave the duplicates behind.
-    bool implied = ctx->res.tree && ctx->res.tree->find(inner).has_value();
-    if (!implied && !g_vol.ns->live_entry(table, *obj, inner)) {
-      std::string err;
-      if (!g_vol.ns->add_file(table, *obj, inner, "", "inode/directory", 0, err))
-        warn("mkdir " + inner + ": " + err);
-    }
+    // folder survives until something lands in it.
+    std::string err;
+    if (!g_vol.ns->add_file(table, *obj, inner, "", "inode/directory", 0, err))
+      warn("mkdir " + inner + ": " + err);
     ctx->res.kind = Resolved::InnerDir;
     fill_file_info(ctx->res, info);
     *file_context = ctx.release();
@@ -1509,11 +1609,24 @@ void write_back(FsContext* ctx) {
   }
 
   if (ctx->is_new) {
-    if (!g_vol.ns->add_file(ctx->res.table, ctx->res.object, ctx->res.inner, hash,
+    // Create checked the name was free; this covers a peer that saved the
+    // same name since (only possible against a server without file leases).
+    // Never register a second row under one name: land beside it instead.
+    std::string target = ctx->res.inner;
+    auto live = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, target);
+    if (live && !live->ephemeral) {
+      if (live->location == hash) {
+        info("created " + target + ": identical content already present");
+        return;
+      }
+      target = conflict_name(target);
+      warn(ctx->res.inner + " appeared while this new file was open -- saving as " + target);
+    }
+    if (!g_vol.ns->add_file(ctx->res.table, ctx->res.object, target, hash,
                             ctx->mimetype, size, err))
-      error("add " + ctx->res.inner + ": " + err);
+      error("add " + target + ": " + err);
     else
-      info("created " + ctx->res.inner + " (" + std::to_string(size) + " bytes)");
+      info("created " + target + " (" + std::to_string(size) + " bytes)");
     return;
   }
 
@@ -1611,8 +1724,9 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
   auto ctx = std::make_unique<FsContext>();
   ctx->res = *r;
 
-  const bool wants_write =
-      (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0;
+  const bool data_read = (granted_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+  const bool data_write = (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+  const bool wants_write = data_write || (granted_access & DELETE) != 0;
   if (r->kind == Resolved::File) {
     if (!r->file->ephemeral && wants_write && !r->file->can_write) return STATUS_ACCESS_DENIED;
     ctx->res.inner = r->file->path;
@@ -1649,6 +1763,21 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
   }
 
   if (r->kind == Resolved::File) {
+    ctx->res.inner = r->file->path;
+    ctx->guid = r->file->guid;
+    ctx->base_hash = r->file->location;
+    ctx->mimetype = r->file->mimetype;
+
+    // Opens that touch no bytes -- renames, deletes, attribute and timestamp
+    // queries -- need no content. Fetching it anyway turned renaming a large
+    // drawing that is not cached into a full download, and made a file whose
+    // content is missing impossible even to delete.
+    if (!data_read && !data_write) {
+      fill_file_info(*r, info);
+      *file_context = ctx.release();
+      return STATUS_SUCCESS;
+    }
+
     auto h = g_vol.ns->hydrate(*r->file);
     if (!h.path) {
       // Report what is actually wrong. STATUS_IO_DEVICE_ERROR reads to users
@@ -1662,12 +1791,8 @@ NTSTATUS SvcOpen(FSP_FILE_SYSTEM*, PWSTR file_name, UINT32, UINT32 granted_acces
       return STATUS_UNEXPECTED_NETWORK_ERROR;
     }
     auto local = h.path;
-    ctx->res.inner = r->file->path;
-    ctx->guid = r->file->guid;
-    ctx->base_hash = r->file->location;
-    ctx->mimetype = r->file->mimetype;
 
-    if (wants_write) {
+    if (data_write) {
       // Copy up: writes never touch the shared, immutable cache blob.
       std::string err;
       if (!open_work(ctx.get(), *local, err)) {
@@ -1856,7 +1981,13 @@ NTSTATUS SvcRename(FSP_FILE_SYSTEM*, PVOID file_context, PWSTR /*file_name*/, PW
 
   // Replacing an existing durable target: soft-delete it first so the name is
   // free (the server keeps it recoverable within retention).
-  auto existing = g_vol.ns->live_entry(ctx->res.table, ctx->res.object, new_inner);
+  // A case-only rename ("plan.dwg" -> "Plan.dwg") finds the file ITSELF as
+  // the existing target; replacing it would delete the very attachment being
+  // renamed. Renaming a file to exactly its own name is a no-op.
+  const bool same_name = lower_ascii(new_inner) == lower_ascii(old_inner);
+  if (new_inner == old_inner) return STATUS_SUCCESS;
+  auto existing = same_name ? std::nullopt
+                            : g_vol.ns->live_entry(ctx->res.table, ctx->res.object, new_inner);
   if (existing && !existing->guid.empty()) {
     if (!replace_if_exists) {
       undo_lease();
@@ -2062,6 +2193,7 @@ int run_mount(const Options& o) {
   ws.refresh_client_token(o.token);  // slide expiry on every mount
   FileCache cache;
   sweep_stale_parts(cache.root());
+  sweep_orphan_work(cache);
   NamespaceService ns(ws, cache);
   std::string err;
   FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);
@@ -2116,6 +2248,8 @@ int run_agent(const Options& base) {
       }
       ws.refresh_client_token(o.token);
       FileCache cache;
+      sweep_stale_parts(cache.root());   // downloads a killed agent abandoned
+      sweep_orphan_work(cache);          // working copies it abandoned
       NamespaceService ns(ws, cache);
       std::string err;
       FSP_FILE_SYSTEM* fs = mount_volume(o, ns, err);

@@ -2,7 +2,7 @@
 (temp file promoted into place), a multi-MB file, and a concurrent-edit
 conflict."""
 import hashlib, json, os, sys, time, asyncio, websockets
-SRV="ws://127.0.0.1:17243/"; KEY=50049; ROOT="S:\workorders"
+SRV=os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/"); KEY=50049; ROOT="S:\workorders"
 passed, failed = [], []
 def check(n,c,d=""):
     (passed if c else failed).append(n)

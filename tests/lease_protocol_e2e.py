@@ -10,11 +10,11 @@ verb (plain table names) on a full session.
 Needs: a lease-capable server at ws://127.0.0.1:17243/ (no file service
 required) and the testing login. Mints its own short-lived mount token.
 """
-import asyncio, json, sys
+import os, asyncio, json, sys
 
 import websockets
 
-SRV = "ws://127.0.0.1:17243/"
+SRV = os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 TARGET = {"table": "workorders", "key_type": "id", "key": 50049}
 R, W, D = 1, 2, 4
 

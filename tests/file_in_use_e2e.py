@@ -29,7 +29,7 @@ p.add_argument("--b", default="T:")
 p.add_argument("--crash", type=int, default=0, help="pid of mount A's recordfs process")
 args = p.parse_args()
 
-SRV = "ws://127.0.0.1:17243/"
+SRV = os.environ.get("RECORDFS_TEST_SERVER", "ws://127.0.0.1:17243/")
 KEY = 50049
 PDF = "workorder-signed.pdf"
 

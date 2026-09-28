@@ -36,30 +36,53 @@ struct FileEntry {
   bool ephemeral = false;  // server-memory lock/temp file (protocol §4.3)
 };
 
+// Case folding for names on the drive. The volume is case-insensitive (as
+// Windows applications expect), so "PLAN.DWG" must find "plan.dwg" -- otherwise
+// an app that re-types a path gets "not found", and a save through it creates
+// a second attachment beside the first. ASCII only, matching every other name
+// comparison in the mount and the server's lease keys.
+std::string fold_name(std::string s);
+
 // A record's attachment listing as a directory tree. Directories exist both
 // explicitly (inode/directory entries) and implicitly (path components).
+//
+// Lookups are case-insensitive; names come back in their STORED case. When
+// stored paths disagree on a directory's case ("Photos/a.jpg", "photos/b.jpg")
+// they are one directory, shown in the first spelling seen.
 class FileTree {
 public:
   struct Child {
-    std::string name;
+    std::string name;                 // stored case
     bool is_dir = false;
     const FileEntry* file = nullptr;  // null for directories
   };
 
   void build(std::vector<FileEntry> entries);
 
-  // Children of a directory ("" = the record's root). Sorted by name.
+  // Children of a directory ("" = the record's root), in any case.
+  // Sorted case-insensitively.
   std::vector<Child> list(const std::string& dir) const;
 
-  // Look up one path ("photos/install-1.jpg"). nullopt = doesn't exist.
+  // Look up one path ("photos/install-1.jpg"), in any case. nullopt = doesn't
+  // exist.
   std::optional<Child> find(const std::string& path) const;
+
+  // `path` with every component that already exists spelled the way it is
+  // stored; components that do not exist keep the caller's spelling. New
+  // attachments are registered under this, so creating "PHOTOS/new.jpg"
+  // lands in the existing "photos" folder rather than a case-variant twin.
+  std::string canonical(const std::string& path) const;
 
   const std::vector<FileEntry>& entries() const { return entries_; }
 
 private:
+  struct Slot {
+    std::string name;  // stored case
+    size_t idx;        // file index, or SIZE_MAX for a directory
+  };
   std::vector<FileEntry> entries_;
-  // dir path -> (child name -> file index or SIZE_MAX for directory)
-  std::map<std::string, std::map<std::string, size_t>> dirs_;
+  // folded dir path -> (folded child name -> slot)
+  std::map<std::string, std::map<std::string, Slot>> dirs_;
 };
 
 }  // namespace rfs
