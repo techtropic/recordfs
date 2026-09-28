@@ -2153,7 +2153,12 @@ static FSP_FILE_SYSTEM* mount_volume(const Options& o, NamespaceService& ns, std
   FSP_FILE_SYSTEM* fs = nullptr;
   NTSTATUS st = FspFileSystemCreate((PWSTR)L"" FSP_FSCTL_DISK_DEVICE_NAME, &params, &iface, &fs);
   if (!NT_SUCCESS(st)) {
-    err = "FspFileSystemCreate failed: 0x" + std::to_string((unsigned long)st);
+    char hex[16];
+    sprintf_s(hex, "0x%08lx", (unsigned long)st);
+    // STATUS_NO_SUCH_DEVICE: the WinFsp driver is not running (or cannot run
+    // here at all -- Windows Sandbox, for one, does not load it).
+    err = std::string("FspFileSystemCreate failed: ") + hex +
+          (st == (NTSTATUS)0xC000000EL ? " (the WinFsp driver is not available)" : "");
     return nullptr;
   }
   g_vol.fs = fs;

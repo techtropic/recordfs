@@ -97,7 +97,15 @@ def check(name, cond, detail=""):
 check("installs_old_version", res.get("install_from_exit") == 0 and res.get("from_file_version") == args.frm, res)
 check("updater_service_running", res.get("service_after_install") == "Running", res.get("service_after_install"))
 mounted = res.get("mounted_before_update") is True
-check("drive_mounted", mounted, "mount failed; the deferral and remount checks are skipped")
+# Windows Sandbox does not load WinFsp's kernel driver (STATUS_NO_SUCH_DEVICE,
+# 0xc000000e): the update itself is fully testable there, a live drive is
+# not. Anything else that stops the mount is a real failure.
+no_driver = "0xc000000e" in agent_log.lower() or "3221225486" in agent_log
+if not mounted and no_driver:
+    print("SKIP drive_mounted -- the WinFsp driver does not run in this sandbox; "
+          "the open-file deferral and remount checks need a real (or Hyper-V) machine")
+else:
+    check("drive_mounted", mounted, "mount failed; the deferral and remount checks are skipped")
 check("UPDATED_TO_NEW_VERSION", res.get("installed_version_after") == args.to and
       res.get("file_version_after") == args.to, (res.get("installed_version_after"), res.get("file_version_after")))
 check("service_running_after_update", res.get("service_after_update") == "Running", res.get("service_after_update"))

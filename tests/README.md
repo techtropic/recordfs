@@ -226,3 +226,12 @@ staging folder, updater state and autostart.
 
 Needs Windows Sandbox enabled (the window shows while it runs, 5-10
 minutes, and closes itself) and `SetupRecordFSBundle\redist` populated.
+
+Windows Sandbox does not load WinFsp's kernel driver (the agent logs
+`STATUS_NO_SUCH_DEVICE`, 0xc000000e), so there the drive never mounts and the
+open-file deferral and remount checks are reported as skipped. Everything
+about the update itself is still exercised: verification, the service
+stopping and restarting around msiexec, agents stepping aside and coming
+back, kept settings, the staging ACL, and uninstall. The live-drive checks
+need a real or Hyper-V machine. The first sandbox start on a machine can take
+several minutes.
